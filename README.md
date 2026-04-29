@@ -1,0 +1,1 @@
+# my-pottery-studio-architecture
