@@ -1,0 +1,56 @@
+name: pottery_studio_architecture
+description: >
+  A reference implementation of the offline-first, configurable-workflow
+  architecture behind My Pottery Studio. Demonstrates idempotent versioned
+  migrations, the DAO pattern, in-memory registries with synchronous
+  lookup, and sync-ready schema design — using a generic notes/tags toy
+  domain rather than the real ceramic-production schema.
+
+# Not published to pub.dev — this is a reference repo, not a library.
+publish_to: 'none'
+
+# The architecture-reference repo's version is independent of My Pottery
+# Studio's marketing version. 1.0.0 = first published cut of these
+# architectural pieces.
+version: 1.0.0
+
+environment:
+  sdk: ^3.11.1
+  flutter: ">=3.32.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Database ─────────────────────────────────────────────────────
+  # Mobile/iOS/Android SQLite via the platform's bundled SQLite library.
+  sqflite: ^2.3.0
+
+  # Desktop SQLite (Windows/Linux/macOS) via FFI to a bundled SQLite.
+  # The conditional import in database_initializer routes here at compile
+  # time when not running on web.
+  sqflite_common_ffi: ^2.3.0
+
+  # ── File handling for backup/restore ─────────────────────────────
+  # Cross-platform path manipulation. Used to construct DB paths and
+  # backup file paths consistently across platforms.
+  path: ^1.9.0
+
+  # Platform-aware app directories (Documents, etc.). Used by the
+  # backup service to find a stable location for the most recent export.
+  path_provider: ^2.1.3
+
+  # File picker for backup import (all platforms) and folder picker for
+  # backup export (desktop). Without this, restore would have nowhere
+  # to read from on desktop.
+  file_picker: ^8.0.0
+
+  # OS share sheet integration for backup export on mobile. The user
+  # picks Files, AirDrop, email, etc. — the app never knows where the
+  # backup ends up.
+  share_plus: ^12.0.2
+
+  # ── Identifiers ──────────────────────────────────────────────────
+  # UUID v4 generation for primary keys. Every table in this
+  # architecture uses TEXT UUIDs rather than auto-increment integers
+  # specifically so t

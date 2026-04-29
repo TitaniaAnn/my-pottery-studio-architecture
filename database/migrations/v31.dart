@@ -1,4 +1,4 @@
-/// v31 — Cloud sync foundation.
+/// v31 — Sync foundation.
 ///
 /// This is the migration where the universal-columns convention from v01
 /// (UUID primary keys, ISO 8601 timestamps, nullable userId) earns its
@@ -9,8 +9,8 @@
 /// What this migration adds is the *new* infrastructure sync needs that
 /// the existing tables don't already cover:
 ///
-///   1. A registry of paired devices, so the app remembers who it syncs
-///      with across restarts.
+///   1. A registry of paired peer devices, so the app remembers who it
+///      syncs with across restarts.
 ///   2. A tombstone table for hard-deletes, so peers can replicate
 ///      deletions on rows that don't have a deletedAt column to read.
 ///   3. A staging area for conflicts that can't be auto-resolved, so
