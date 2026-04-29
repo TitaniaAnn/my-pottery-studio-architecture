@@ -1,4 +1,4 @@
-name: pottery_studio_architecture
+name: my_pottery_studio_architecture
 description: >
   A reference implementation of the offline-first, configurable-workflow
   architecture behind My Pottery Studio. Demonstrates idempotent versioned

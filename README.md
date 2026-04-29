@@ -11,7 +11,7 @@ into a generic notes-and-tags toy domain so the patterns can be read
 without the ceramic-specific business logic getting in the way.
 
 ## What's here
-
+```
 lib/
 ├── database/          # Migration system + SQLite initialization
 │   ├── database_service.dart           ← idempotent migration runner
@@ -29,7 +29,7 @@ lib/
 ├── notes_dao.dart              ← simple CRUD pattern
 ├── pipelines_dao.dart          ← workflow engine data layer
 └── custom_stages_dao.dart      ← user-config CRUD pattern
-
+```
 About 21 source files. Substantial enough to demonstrate real
 architecture; small enough to read in fifteen minutes.
 
@@ -112,6 +112,7 @@ different repo.
 ```bash
 flutter pub get
 flutter run
+```
 
 The app launches to a placeholder screen. Its only purpose is to
 demonstrate that the architecture compiles and the startup sequence

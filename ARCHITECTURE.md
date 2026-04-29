@@ -119,7 +119,7 @@ userId    TEXT                — nullable, ready for a future backend
 createdAt TEXT NOT NULL       — ISO 8601 timestamp
 updatedAt TEXT NOT NULL       — ISO 8601 timestamp, bumped on every write
 deletedAt TEXT                — nullable; soft-delete pattern
-
+```
 These five columns are not optional. They are the universal-columns
 convention, and every migration that creates a new user-data table
 includes them all. The convention is enforced by code review rather
@@ -437,7 +437,7 @@ different implementation files at compile time:
 ```dart
 import 'database_initializer_io.dart'
 if (dart.library.html) 'database_initializer_web.dart';
-
+```
 The IO version handles desktop FFI initialization; the web version is
 a no-op. The main file's `initDatabase()` is a single async call that
 the rest of the app makes once, at startup, with no awareness of
