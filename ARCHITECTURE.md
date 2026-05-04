@@ -140,7 +140,12 @@ Each column does specific work:
 - **Soft-delete via deletedAt** means deletions can be replicated to
   peer devices. Hard-deleted rows just disappear — the peer has no way
   to learn the row was deleted, only that it's no longer present,
-  which is indistinguishable from "we haven't synced yet."
+  which is indistinguishable from "we haven't synced yet." A subtle
+  invariant rides along: when soft-delete fires, `updatedAt` must
+  move to the same value as `deletedAt`. If it doesn't, last-writer-
+  wins resolution would let any later edit on a peer beat the local
+  delete, silently revoking it. This is verified in
+  [`test/dao_soft_delete_test.dart`](test/dao_soft_delete_test.dart).
 
 ### Why not the alternatives
 
@@ -257,6 +262,18 @@ version, the runner will incorrectly rethrow. This is a fragility
 worth knowing about. Production has not been bitten by it yet, but
 the right long-term fix is matching on a richer error type if sqflite
 ever exposes one.
+
+### Verified by
+
+[`test/migration_idempotency_test.dart`](test/migration_idempotency_test.dart)
+exercises the contract directly: it re-runs every v36 statement on
+top of an already-current schema and asserts that no exception
+escapes. It also asserts that every version registered in
+`SchemaScripts.migrations` ([schema_scripts.dart](lib/database/schema_scripts.dart))
+has at least one statement and that no registered version exceeds
+`DatabaseService.kSchemaVersion` ([database_service.dart](lib/database/database_service.dart))
+— catching the "bumped the constant but forgot to register vN"
+slip that would silently leave the new migration unrun on upgrade.
 
 ---
 
@@ -585,6 +602,22 @@ metadata sync needs. v31 ships as new tables only:
 The `syncSourceDevice` column added to photo tables is the only
 existing-table change in v31, and it's nullable — old rows leave it
 null and don't break.
+
+[Migration v36](lib/database/migrations/v36.dart) is the second
+piece of evidence in the same file. v31 created
+`sync_hard_delete_log` with `id TEXT PRIMARY KEY` and a non-unique
+index on `(tableName, rowId)`. Both the DAO write path and the sync
+inbound path generate a fresh random `id` per insert, so an `INSERT
+OR IGNORE` on the random PK never trips and duplicates accumulate.
+v36 dedupes the table, drops the v31 index, and replaces it with a
+UNIQUE one — the kind of change that, on any other architecture,
+might require a backfill across user-data tables. Here it doesn't,
+because the user-data tables aren't affected: the sync schema's
+contract with the rest of the database is one-way (sync reads,
+user-data writes, never the inverse). Tightening one end of that
+contract is local to the sync schema. The second-payoff story
+matters more than the technical fix: it's the same pattern as v31,
+the second time, and it stays cheap for the same reason.
 
 ### Why not the alternatives
 

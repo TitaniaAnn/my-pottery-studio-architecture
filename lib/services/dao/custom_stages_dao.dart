@@ -1,6 +1,6 @@
 import 'package:uuid/uuid.dart';
 
-import '../database_service.dart';
+import '../../database/database_service.dart';
 import '../../models/custom_stage.dart';
 import '../../models/stage_definition.dart';
 

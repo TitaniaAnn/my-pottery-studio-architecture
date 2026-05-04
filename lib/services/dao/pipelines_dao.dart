@@ -1,7 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
-import '../database_service.dart';
+import '../../database/database_service.dart';
 import '../../models/pipeline.dart';
 
 /// CRUD for user-configurable workflow pipelines.

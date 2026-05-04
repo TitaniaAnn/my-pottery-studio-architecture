@@ -40,6 +40,14 @@ import '../services/stage_registry.dart';
 class DatabaseService {
   // ── Singleton setup ────────────────────────────────────────────
 
+  /// Current schema version. Bump this when adding a new vNN.dart
+  /// migration file and registering it in [SchemaScripts.migrations].
+  ///
+  /// Exposed as a constant so tests can iterate `for (var v = 1; v <=
+  /// kSchemaVersion; v++)` to assert every version is registered, which
+  /// catches the "bumped the version but forgot to register vN" slip.
+  static const int kSchemaVersion = 36;
+
   static final DatabaseService instance = DatabaseService._init();
   static Database? _database;
 
@@ -77,7 +85,7 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 28,
+      version: kSchemaVersion,
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );

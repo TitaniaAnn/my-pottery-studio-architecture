@@ -1,6 +1,6 @@
 import 'package:uuid/uuid.dart';
 
-import '../database_service.dart';
+import '../../database/database_service.dart';
 import '../../models/note.dart';
 
 /// CRUD for notes — the entity that flows through configurable
@@ -88,13 +88,20 @@ class NotesDao {
   /// Hard DELETE is never called from application code; rows are only
   /// physically removed by background cleanup jobs (not implemented in
   /// this reference architecture).
+  ///
+  /// `updatedAt` and `deletedAt` are written from a single timestamp,
+  /// not two separate `DateTime.now()` calls. They have to be equal:
+  /// last-writer-wins sync resolves a "local soft-deleted, remote
+  /// edited" race by comparing `updatedAt`s, and a delete that fails
+  /// to bump `updatedAt` would lose to any later edit on the peer.
   Future<void> softDelete(String id) async {
     final db = await _db.database;
+    final now = DateTime.now().toIso8601String();
     await db.update(
       'notes',
       {
-        'deletedAt': DateTime.now().toIso8601String(),
-        'updatedAt': DateTime.now().toIso8601String(),
+        'deletedAt': now,
+        'updatedAt': now,
       },
       where: 'id = ?',
       whereArgs: [id],

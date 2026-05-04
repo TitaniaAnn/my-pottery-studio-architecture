@@ -22,15 +22,20 @@ lib/
 │       ├── v11.dart                    ← multi-table feature add
 │       ├── v12.dart                    ← bulk ALTER TABLE pattern
 │       ├── v26.dart                    ← config table replacing enum
-│       └── v31.dart                    ← sync foundation
+│       ├── v31.dart                    ← sync foundation
+│       └── v36.dart                    ← self-healing tombstone dedup
 ├── models/            # Domain models with the universal-columns pattern
 └── services/          # DAOs + in-memory registries + local backup
 └── dao/
 ├── notes_dao.dart              ← simple CRUD pattern
 ├── pipelines_dao.dart          ← workflow engine data layer
 └── custom_stages_dao.dart      ← user-config CRUD pattern
+
+test/                  # Verifies the contract claims in ARCHITECTURE.md
+├── migration_idempotency_test.dart  ← §3 idempotency, v36 dedup, registration
+└── dao_soft_delete_test.dart        ← §2 / §8 LWW invariant
 ```
-About 21 source files. Substantial enough to demonstrate real
+About 26 source files. Substantial enough to demonstrate real
 architecture; small enough to read in fifteen minutes.
 
 ## What this demonstrates
@@ -76,9 +81,12 @@ is implemented:
    demonstrates the bet paying off: sync infrastructure ships as new
    tables only — a paired-device registry, a hard-delete tombstone
    log, and a conflict staging area — with every existing user-data
-   table untouched.
+   table untouched. v36 is the second piece of evidence: tightening
+   the tombstone log's uniqueness constraint after real use exposed
+   that random PKs were defeating its `INSERT OR IGNORE`, again
+   without touching any user-data table.
    *([v01.dart][v01] for the convention, [v31.dart][v31] for the
-   payoff)*
+   first payoff, [v36.dart][v36] for the second)*
 
 For a deeper walkthrough of why each decision was made, see
 [ARCHITECTURE.md][arch].
@@ -92,11 +100,11 @@ This is a reference architecture. It is deliberately missing:
 - **Domain-specific code.** Glazes, kilns, sales, clients, commissions,
   inventory — all the things that make My Pottery Studio a *product*
   rather than a *pattern* — are not here.
-- **The full migration history.** The production app is at schema v31+
-  with new versions shipping on an ongoing basis. Five representative
+- **The full migration history.** The production app is at schema v36+
+  with new versions shipping on an ongoing basis. Six representative
   versions are published here, with their original numbers preserved so
-  that v31's references to v01's universal-columns convention remain
-  coherent.
+  that v31's references to v01's universal-columns convention and v36's
+  hardening of v31's `sync_hard_delete_log` remain coherent.
 - **Authentication, monetization, sync runtime.** No auth flows, no
   in-app purchases. The schema groundwork that makes peer-to-peer
   sync possible is here (v31); the runtime that uses it lives in the
@@ -111,6 +119,7 @@ different repo.
 
 ```bash
 flutter pub get
+flutter test          # the contract claims, verified
 flutter run
 ```
 
@@ -118,6 +127,12 @@ The app launches to a placeholder screen. Its only purpose is to
 demonstrate that the architecture compiles and the startup sequence
 runs. The interesting code is in `lib/database/` and `lib/services/`,
 not on screen.
+
+The test suite verifies the architectural claims that ARCHITECTURE.md
+makes — idempotent migrations, self-healing tombstone dedup, and the
+last-writer-wins invariant that soft-delete depends on. Reading those
+tests is a faster path into the codebase than reading the source
+top-down.
 
 ## Why this exists
 
@@ -159,6 +174,7 @@ Built by [Cynthia Brown][site]. More work at:
 [v01]: lib/database/migrations/v01.dart
 [v26]: lib/database/migrations/v26.dart
 [v31]: lib/database/migrations/v31.dart
+[v36]: lib/database/migrations/v36.dart
 [dbsvc]: lib/database/database_service.dart
 [dao]: lib/services/dao/
 [pipereg]: lib/services/pipeline_registry.dart
