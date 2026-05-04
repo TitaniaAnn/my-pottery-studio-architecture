@@ -26,10 +26,10 @@ lib/
 │       └── v36.dart                    ← self-healing tombstone dedup
 ├── models/            # Domain models with the universal-columns pattern
 └── services/          # DAOs + in-memory registries + local backup
-└── dao/
-├── notes_dao.dart              ← simple CRUD pattern
-├── pipelines_dao.dart          ← workflow engine data layer
-└── custom_stages_dao.dart      ← user-config CRUD pattern
+    └── dao/
+        ├── notes_dao.dart              ← simple CRUD pattern
+        ├── pipelines_dao.dart          ← workflow engine data layer
+        └── custom_stages_dao.dart      ← user-config CRUD pattern
 
 test/                  # Verifies the contract claims in ARCHITECTURE.md
 ├── migration_idempotency_test.dart  ← §3 idempotency, v36 dedup, registration
