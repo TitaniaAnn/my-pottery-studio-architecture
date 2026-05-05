@@ -13,30 +13,47 @@ without the ceramic-specific business logic getting in the way.
 ## What's here
 ```
 lib/
-├── database/          # Migration system + SQLite initialization
-│   ├── database_service.dart           ← idempotent migration runner
-│   ├── database_initializer*.dart      ← platform-conditional sqflite setup
-│   ├── schema_scripts.dart             ← version → SQL registry
+├── main.dart                              ← startup wiring (initDatabase → migrations → registries)
+│
+├── database/                              # Migration system + SQLite initialization
+│   ├── database_service.dart              ← singleton, idempotent migration runner, DAO accessors
+│   ├── database_initializer.dart          ← conditional-import entry point
+│   ├── database_initializer_io.dart       ← mobile + desktop FFI setup
+│   ├── database_initializer_web.dart      ← web no-op stub
+│   ├── schema_scripts.dart                ← version → SQL registry
 │   └── migrations/
-│       ├── v01.dart                    ← initial schema, base columns
-│       ├── v11.dart                    ← multi-table feature add
-│       ├── v12.dart                    ← bulk ALTER TABLE pattern
-│       ├── v26.dart                    ← config table replacing enum
-│       ├── v31.dart                    ← sync foundation
-│       └── v36.dart                    ← self-healing tombstone dedup
-├── models/            # Domain models with the universal-columns pattern
-└── services/          # DAOs + in-memory registries + local backup
+│       ├── v01.dart                       ← notes table, universal columns
+│       ├── v11.dart                       ← tags + note_tags join (3 statements)
+│       ├── v12.dart                       ← bulk ALTER TABLE pattern (notes v2)
+│       ├── v26.dart                       ← categories table replacing enum
+│       ├── v31.dart                       ← sync foundation (3 new tables, 1 ALTER)
+│       └── v36.dart                       ← self-healing tombstone dedup
+│
+├── models/                                # Domain entities + the universal-columns pattern
+│   ├── note.dart                          ← entity with universal columns + workflow refs
+│   ├── built_in_stage.dart                ← enum with stable dbName for safe persistence
+│   ├── custom_stage.dart                  ← user-created stage type (sketch)
+│   ├── stage_definition.dart              ← unified handle for built-in + custom stages
+│   ├── pipeline.dart                      ← workflow definition with JSON-encoded stage list
+│   └── transition_event.dart              ← immutable lifecycle audit entry
+│
+└── services/                              # DAOs + in-memory registries + local backup
+    ├── local_backup_service.dart          ← atomic copy-then-rename restore
+    ├── pipeline_registry.dart             ← in-memory cache, synchronous lookup
+    ├── stage_registry.dart                ← built-in (from enum) + custom (from DB) unified
     └── dao/
-        ├── notes_dao.dart              ← simple CRUD pattern
-        ├── pipelines_dao.dart          ← workflow engine data layer
-        └── custom_stages_dao.dart      ← user-config CRUD pattern
+        ├── notes_dao.dart                 ← simple CRUD pattern, soft-delete with LWW invariant
+        ├── pipelines_dao.dart             ← sketch — queries pipeline_types, no migration creates it
+        └── custom_stages_dao.dart         ← sketch — same caveat; file is also currently truncated
 
-test/                  # Verifies the contract claims in ARCHITECTURE.md
-├── migration_idempotency_test.dart  ← §3 idempotency, v36 dedup, registration
-└── dao_soft_delete_test.dart        ← §2 / §8 LWW invariant
+test/                                      # Verifies the contract claims in ARCHITECTURE.md
+├── migration_idempotency_test.dart        ← §3 idempotency, v36 dedup + unique-index, registration
+└── dao_soft_delete_test.dart              ← §2 / §8 last-writer-wins invariant
 ```
-About 26 source files. Substantial enough to demonstrate real
-architecture; small enough to read in fifteen minutes.
+26 Dart files in total — 24 under `lib/` (1 entrypoint, 6 in
+`database/`, 6 migrations, 6 models, 5 in `services/`) and 2 under
+`test/`. Substantial enough to demonstrate real architecture; small
+enough to read in fifteen minutes.
 
 ## What this demonstrates
 
@@ -44,9 +61,15 @@ The architectural decisions documented in detail in
 [ARCHITECTURE.md][arch], with the file in this repo where each one
 is implemented:
 
-1. **Configurable workflow engine** — pipelines, stages, and transitions
-   stored as data rather than hardcoded enums, so users define their own
-   production processes. *([pipeline.dart][pipeline], [v26.dart][v26])*
+1. **Config tables replace hardcoded enums** — types the app once
+   shipped as enums move to data tables, so users can add or edit them
+   without a code change. v26 demonstrates the pivot at small scale by
+   replacing a `NoteCategory` enum with a `categories` table seeded so
+   existing rows resolve without backfill. The `Pipeline`,
+   `CustomStage`, `StageDefinition`, and `TransitionEvent` models, plus
+   the matching DAOs and registries, sketch the same pattern at
+   workflow-engine scale — see *What's not here* for the caveat.
+   *([v26.dart][v26], [pipeline.dart][pipeline] for the sketch)*
 
 2. **Offline-first SQLite architecture** — every table designed from day
    one for future cloud sync via UUID primary keys and ISO 8601
@@ -62,9 +85,12 @@ is implemented:
    each owning the SQL for one table. Application code never sees raw
    SQL. *([dao/][dao])*
 
-5. **Reactive registries with synchronous lookup** — pipelines and
-   stages are loaded once at app startup into in-memory registries, so
-   widget tree code never needs FutureBuilders for stable configuration.
+5. **In-memory registries for synchronous lookup** — slow-changing
+   config is loaded once at app startup into an in-memory cache, so
+   widget code reads it synchronously rather than through `FutureBuilder`
+   on every render. The published registries are part of the
+   workflow-engine sketch above; the loading pattern (hydrate at
+   startup, refresh after writes) is what's architecturally interesting.
    *([pipeline_registry.dart][pipereg], [stage_registry.dart][stagereg])*
 
 6. **Cross-platform sqflite** — conditional imports route mobile,
@@ -105,6 +131,15 @@ This is a reference architecture. It is deliberately missing:
   versions are published here, with their original numbers preserved so
   that v31's references to v01's universal-columns convention and v36's
   hardening of v31's `sync_hard_delete_log` remain coherent.
+- **The migrations that create `pipeline_types` and `custom_stages`.**
+  The production app has migrations that create these tables and add
+  `pipelineId` / `currentStage` columns to notes. Those migrations are
+  not in this published cut. The `Pipeline` / `CustomStage` /
+  `StageDefinition` models, the `pipelines_dao` and `custom_stages_dao`
+  classes, and the two registries are included as a sketch of how the
+  config-table pattern scales to a workflow engine, but they query
+  tables that this cut's schema doesn't create. v26's categories
+  migration is the runnable demonstration of the same pattern.
 - **Authentication, monetization, sync runtime.** No auth flows, no
   in-app purchases. The schema groundwork that makes peer-to-peer
   sync possible is here (v31); the runtime that uses it lives in the
@@ -120,19 +155,26 @@ different repo.
 ```bash
 flutter pub get
 flutter test          # the contract claims, verified
-flutter run
 ```
 
-The app launches to a placeholder screen. Its only purpose is to
-demonstrate that the architecture compiles and the startup sequence
-runs. The interesting code is in `lib/database/` and `lib/services/`,
-not on screen.
+`flutter test` is the canonical entry point for this repo. The two
+test files verify the architectural claims that ARCHITECTURE.md
+makes — idempotent migrations, registration of every version up to
+`kSchemaVersion`, the v36 dedup logic and unique-index contract, and
+the last-writer-wins invariant that soft-delete depends on. They run
+against an in-memory SQLite database, so the suite executes the real
+migration runner without writing to disk.
 
-The test suite verifies the architectural claims that ARCHITECTURE.md
-makes — idempotent migrations, self-healing tombstone dedup, and the
-last-writer-wins invariant that soft-delete depends on. Reading those
-tests is a faster path into the codebase than reading the source
-top-down.
+Reading those tests is a faster path into the codebase than reading
+the source top-down — each test docstring names the specific
+ARCHITECTURE.md section the assertion is verifying.
+
+`flutter run` is **not** wired up in this published cut. `main.dart`
+calls `loadPipelineRegistry()` and `loadStageRegistry()` at startup,
+which query `pipeline_types` and `custom_stages` tables that aren't
+created by any of the included migrations (see *What's not here*).
+The interesting code lives in `lib/database/` and `lib/services/`,
+and is exercised by `flutter test`.
 
 ## Why this exists
 

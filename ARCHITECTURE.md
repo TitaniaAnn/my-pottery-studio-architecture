@@ -12,79 +12,118 @@ on; the later ones are the ones that would be easiest to swap out.
 
 ---
 
-## 1. Configurable workflow engine
+## 1. Config tables replace hardcoded enums
 
 ### The problem
 
-The product this architecture serves is studio management for ceramic
-artists. The central abstraction is a *piece* — a physical object that
-moves through a multi-stage production lifecycle (clay preparation,
-forming, drying, bisque firing, glazing, glaze firing, finishing,
-sale). Different artists work different ways: a hand-builder skips the
-throwing stage, a raku potter has a different firing schedule than a
-stoneware potter, a production studio has stages a beginner doesn't.
+Apps tend to ship "types" as enums — categories, statuses, stages,
+priority levels, anything that looks like a fixed set of choices.
+Enums work until they don't: the moment a user wants a category the
+app doesn't ship with, an enum is a code change away from solving
+their problem, and a code change is something the user can't make.
 
-The naive approach — a hardcoded enum of pottery stages — was the
-first version of the app, and it was wrong on contact with users. Some
-artists wanted stages we hadn't included; some wanted to skip stages
-we'd assumed were universal; some wanted entirely different production
-processes for different kinds of work.
+For My Pottery Studio specifically, the central case is the
+production-stage enum — a piece moves through clay prep, forming,
+drying, bisque firing, glazing, glaze firing, finishing, sale.
+Different artists work differently: a hand-builder skips throwing, a
+raku potter has a different firing schedule than a stoneware potter,
+a production studio has stages a beginner doesn't. That product
+problem is what motivated this architectural pattern in the first
+place.
 
-The architectural problem is: how do you build a state machine where
-the states themselves are user-defined?
+The architectural problem, stated generally: how do you ship a type
+that started as an enum so that users can add to it without a code
+change?
 
 ### The decision
 
-Pipelines, stages, and transitions are stored as data, not code. A
-[Pipeline](lib/models/pipeline.dart) is a row in the database with a
-JSON-encoded list of stage IDs in their canonical order. A
-[StageDefinition](lib/models/stage_definition.dart) is the unified
-representation of either a built-in stage (referenced by a stable
-string ID like `'review'`) or a user-created
-[CustomStage](lib/models/custom_stage.dart) (referenced by UUID).
+Move the enum into a data table, with a `isBuiltIn` flag separating
+the rows the app seeds from the rows the user creates. The seeded IDs
+match the strings the old enum used, so existing rows that reference
+the enum value resolve to the new row without a data backfill.
 
-[Migration v26](lib/database/migrations/v26.dart) is the migration
-where this pivot happened. Before v26, pipelines were a hardcoded
-enum; v26 introduced the `pipeline_types` table and seeded the
-built-in pipelines with IDs that matched the existing enum string
-values. Existing pieces continued to resolve to the correct pipeline
-without any data migration — every `pieces.type` value already
-referenced a pipeline ID that now existed in the new table.
+[Migration v26](lib/database/migrations/v26.dart) is the published
+example. Before v26, the app had a hardcoded `NoteCategory` enum with
+three values: personal, work, reference. v26 creates a `categories`
+table and seeds those three rows with `id` values that match the
+existing enum strings. Notes that were tagged `'work'` at the string
+level now reference `categories.id = 'work'` after the migration —
+no data migration needed.
 
-That seeding trick — making old enum values into new primary keys —
-is the bit worth pausing on. It meant the migration shipped without a
-single row of data backfill. The existing schema's design decisions
-(string-typed enum columns rather than integer-typed) made this
-possible. It would not have worked with `int` enum columns indexed
-into the old enum's `.values` list.
+That seeding trick is the bit worth pausing on. It only works because
+the original `notes.category` column was a TEXT field holding the
+enum's string name, not an INTEGER holding the enum's `.values`
+index. If it had been an integer, the migration would have needed
+either a `categories.legacyIndex` column or a row-by-row
+backfill — both more painful than the actual migration, which is
+four SQL statements (one CREATE TABLE plus three INSERT OR IGNOREs).
+
+### Same pattern, larger scale (sketched, not in this cut)
+
+The production app uses the same pattern at workflow-engine scale:
+a `pipeline_types` table for the production processes themselves, a
+`custom_stages` table for user-created stages, and `pipelineId` /
+`currentStage` columns on the entity table so each row knows which
+pipeline it's flowing through and where in that pipeline it currently
+sits.
+
+This published cut includes the *code* side of that
+larger-scale version — [Pipeline](lib/models/pipeline.dart),
+[CustomStage](lib/models/custom_stage.dart),
+[StageDefinition](lib/models/stage_definition.dart) (a unified handle
+for either a built-in stage referenced by string ID or a user-created
+one referenced by UUID),
+[TransitionEvent](lib/models/transition_event.dart),
+[`PipelinesDao`](lib/services/dao/pipelines_dao.dart),
+[`CustomStagesDao`](lib/services/dao/custom_stages_dao.dart),
+[`PipelineRegistry`](lib/services/pipeline_registry.dart),
+[`StageRegistry`](lib/services/stage_registry.dart) — but it does
+*not* include the migrations that would create the `pipeline_types`
+and `custom_stages` tables, or the migration that would add
+`pipelineId` / `currentStage` to notes. Those migrations live in the
+production app and are deliberately not republished here.
+
+The consequence is that the workflow-engine code reads as a sketch:
+the shapes show how the categories pattern scales — registry
+hydrated at startup, built-ins protected from deletion via a SQL
+clause, custom rows held alongside built-ins under a unified
+`StageDefinition` interface — but you can't actually run them
+end-to-end against this cut's schema. The runnable demonstration of
+the underlying pattern is v26.
 
 ### Why not the alternatives
 
-A more "proper" object-oriented design would have made each pipeline
-type a subclass of an abstract `Pipeline` class, with the stages
-defined as methods or constants. That works fine when pipelines are
-known at compile time. It does not work when users define their own.
+A more "proper" object-oriented design would have made each enum
+value a subclass of an abstract base class, with behavior defined as
+methods. That works fine when the value set is known at compile time.
+It does not work when users define their own values.
 
 A workflow library (Temporal, Camunda, etc.) would have been the
-enterprise answer. They're enormous, server-bound, and assume a
-pipeline orchestrator that doesn't exist in a mobile app's process
-model. The whole point of offline-first is that the workflow runs in
-the user's hand, not on a server.
+enterprise answer for the workflow-engine version of this. They're
+enormous, server-bound, and assume an orchestrator that doesn't exist
+in a mobile app's process model. The whole point of offline-first is
+that the workflow runs in the user's hand, not on a server.
 
 A finite state machine library would have been overkill. The actual
 runtime logic is small enough that a custom implementation costs less
-to maintain than a third-party dependency that we'd outgrow on the
-first feature request that didn't fit its abstractions.
+to maintain than a third-party dependency we'd outgrow on the first
+feature request that didn't fit its abstractions.
 
 ### Where the seams are
 
-The architecture supports linear pipelines today. Branching pipelines
-(where a piece can go to one of several next stages depending on
-condition) are representable in the schema — `stages` is a list, but
-nothing prevents extending it to a graph — but no UI or runtime logic
-exists for them yet. If you wanted to add branching, the migration
-would be small (a `transitions` table linking stage pairs); the work
-is in the runtime that decides which branch to take.
+For categories specifically, the seam is at growth: a flat table is
+fine for the dozen rows a user might realistically create, but a
+nested-category feature would need either a `parentId` column or a
+separate hierarchy table.
+
+For the workflow-engine sketch, the schema supports linear pipelines
+(`Pipeline.stages` is a JSON-encoded ordered list of stage IDs).
+Branching pipelines — where a piece can move to one of several next
+stages depending on condition — are representable with a small
+migration (a `transitions` table linking stage pairs), but no UI or
+runtime logic exists for them. If you wanted to add branching, the
+migration is the easy part; the work is in the runtime that decides
+which branch to take.
 
 ---
 
@@ -346,7 +385,7 @@ needed to plug in. There is no current pressure for this.
 
 ---
 
-## 5. Reactive registries with synchronous lookup
+## 5. In-memory registries for synchronous lookup
 
 ### The problem
 
@@ -370,7 +409,11 @@ singletons that hold the full list of pipelines and stages. They are
 populated once at app startup, after the database is open
 (`DatabaseService.instance.loadPipelineRegistry()` and
 `loadStageRegistry()` in `main.dart`), and exposed as synchronous
-getters thereafter.
+getters thereafter. `StageRegistry` additionally pre-loads the
+built-in stages from the [`BuiltInStage`](lib/models/built_in_stage.dart)
+enum at construction time, so even before any DB load the built-in
+stages are available — `loadCustom()` only adds the user-created
+ones to the unified view.
 
 The registries deliberately don't auto-refresh. When application code
 creates, updates, or deletes a pipeline, it's the caller's
@@ -384,6 +427,20 @@ The cost is one bug class: if a caller forgets to refresh after a
 mutation, the UI will show stale data until the next launch. The
 benefit is no surprises — reads are always synchronous, always cheap,
 and never racy.
+
+### A note on this published cut
+
+These registries are part of the workflow-engine sketch from §1. The
+loaders themselves (`load`, `loadCustom`, the singleton accessors,
+the null-tolerant `get(String? id)` lookup) are the architecturally
+interesting part and are fully present. What's missing is the
+underlying tables: `loadPipelineRegistry()` calls `pipelines.getAll()`
+which queries `pipeline_types`, and `loadStageRegistry()` calls
+`customStages.getAll()` which queries `custom_stages`. Neither table
+is created by any migration in this published cut, so the startup
+calls in `main.dart` would crash on a real run. The pattern is what's
+on display; the wiring would be completed by the migrations referenced
+in §1 above.
 
 ### Why not the alternatives
 
@@ -549,13 +606,14 @@ needs.
 
 ### Where the seams are
 
-Backups don't currently include media files (photos attached to
-notes/pieces). The `.db` file references file paths that exist on
+Backups don't currently include media files attached to notes (in
+the production app: photos of pieces; in this cut: any external file
+a note references). The `.db` file stores file paths that point at
 the originating device's filesystem; restoring on a different device
-would leave broken photo references. This is a known limitation —
-the v31 sync foundation includes a `syncSourceDevice` column on
-photo tables specifically to handle this, but the runtime that
-uses it is not yet built.
+would leave those references broken. This is a known limitation —
+the v31 sync foundation adds a `syncSourceDevice` column to the
+notes table specifically as the hook a future media-reconciliation
+runtime would read from, but that runtime is not yet built.
 
 ---
 
@@ -599,9 +657,11 @@ metadata sync needs. v31 ships as new tables only:
   silently auto-resolving (which is always wrong some of the time),
   the conflict is staged for manual resolution on next sync.
 
-The `syncSourceDevice` column added to photo tables is the only
+The `syncSourceDevice` column added to the notes table is the only
 existing-table change in v31, and it's nullable — old rows leave it
-null and don't break.
+null and don't break. (In the production app the same column is
+added to the tables that hold media references; in this cut, notes
+stand in for that role.)
 
 [Migration v36](lib/database/migrations/v36.dart) is the second
 piece of evidence in the same file. v31 created
@@ -671,14 +731,21 @@ each piece is shaped by the others." The eight headings are
 pedagogical scaffolding; the architecture is the relationships
 between them.
 
-The relationships are also where this repo is most honest. The full 
-app is at v31+ schema versions; only five are published here. The 
-production schema covers thirty-three tables across eight domains; 
-the public repo demonstrates the patterns with three. The sync runtime 
-exists in some form on the develop branch; none of it is here. What's 
-published is enough to demonstrate the patterns and verify the case 
-study's claims. It is not enough to clone-and-ship a competing product, 
-and that's deliberate.
+The relationships are also where this repo is most honest. The full
+app is past v36 with new versions shipping on an ongoing basis; six
+representative versions are published here. The production schema
+covers many tables across several domains; this cut runs four
+(`notes`, `tags`, `note_tags`, `categories`) and adds three more in
+the v31 sync foundation (`sync_trusted_devices`,
+`sync_hard_delete_log`, `sync_conflicts`). The workflow-engine tables
+that the sketched `Pipeline` / `CustomStage` code would query
+(`pipeline_types`, `custom_stages`, plus `pipelineId` / `currentStage`
+columns on notes) are not in this cut — the runnable demonstration of
+their underlying pattern is v26's categories migration. The sync
+runtime exists in some form on the develop branch; none of it is here.
+What's published is enough to demonstrate the patterns and verify the
+case study's claims. It is not enough to clone-and-ship a competing
+product, and that's deliberate.
 
 ---
 
