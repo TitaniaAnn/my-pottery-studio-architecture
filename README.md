@@ -114,6 +114,16 @@ is implemented:
    *([v01.dart][v01] for the convention, [v31.dart][v31] for the
    first payoff, [v36.dart][v36] for the second)*
 
+9. **Privacy-first observability** — a local diagnostic logger (ring
+   buffer plus a size-capped rotating file pair, UTC timestamps,
+   nothing leaves the device without an explicit share action) and
+   strictly opt-in crash reporting that is compiled out entirely of
+   builds without a DSN, wrapped around a guarded startup path that
+   turns migration failures into a copyable diagnostic instead of a
+   silent crash. This layer shipped in the production app after this
+   cut was published; it is documented in [ARCHITECTURE.md][arch] §9
+   but its code is not in this repo.
+
 For a deeper walkthrough of why each decision was made, see
 [ARCHITECTURE.md][arch].
 
@@ -126,11 +136,16 @@ This is a reference architecture. It is deliberately missing:
 - **Domain-specific code.** Glazes, kilns, sales, clients, commissions,
   inventory — all the things that make My Pottery Studio a *product*
   rather than a *pattern* — are not here.
-- **The full migration history.** The production app is at schema v36+
+- **The full migration history.** The production app is at schema v36
   with new versions shipping on an ongoing basis. Six representative
-  versions are published here, with their original numbers preserved so
-  that v31's references to v01's universal-columns convention and v36's
-  hardening of v31's `sync_hard_delete_log` remain coherent.
+  versions are published here. Versions 1–31 carry their original
+  production numbers; production's numbering diverged after v31 (its
+  own v32–v36 went to sync pairing tokens, import provenance, a
+  foreign-key enforcement repair, and a sync history log — see
+  ARCHITECTURE.md §3 and §8), so the tombstone-hardening migration
+  published here keeps the number 36 for this cut's internal
+  coherence — its references to v31's `sync_hard_delete_log` stay
+  readable — rather than as a claim about production's v36.
 - **The migrations that create `pipeline_types` and `custom_stages`.**
   The production app has migrations that create these tables and add
   `pipelineId` / `currentStage` columns to notes. Those migrations are
@@ -142,10 +157,19 @@ This is a reference architecture. It is deliberately missing:
   migration is the runnable demonstration of the same pattern.
 - **Authentication, monetization, sync runtime.** No auth flows, no
   in-app purchases. The schema groundwork that makes peer-to-peer
-  sync possible is here (v31); the runtime that uses it lives in the
-  product. That separation is deliberate — the schema is the contract
-  any runtime would respect, and publishing the schema lets the
-  contract be evaluated independently of any specific implementation.
+  sync possible is here (v31); the runtime that uses it has since
+  shipped in the product — a fully local peer-to-peer engine (mDNS
+  discovery, PIN pairing with per-device shared tokens, per-peer
+  watermark deltas, last-writer-wins merge with opt-in conflict
+  staging, manifest-driven photo pulls), described at the end of
+  ARCHITECTURE.md §8. Its code stays in the product. That separation
+  is deliberate — the schema is the contract any runtime would
+  respect, and publishing the schema lets the contract be evaluated
+  independently of any specific implementation.
+- **The observability layer.** The production app added local
+  diagnostic logging, opt-in crash reporting, and a guarded startup
+  path in mid-2026. Documented in ARCHITECTURE.md §9; none of its
+  code is in this cut.
 
 If you're looking for any of those things, you're looking for a
 different repo.

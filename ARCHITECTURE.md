@@ -6,7 +6,7 @@ lives. This document tells you *why* — what problem each decision
 solves, what alternatives were considered, and where the seams are
 that future work would extend.
 
-The eight decisions below are roughly ordered from most foundational
+The nine decisions below are roughly ordered from most foundational
 to most product-facing. The earlier ones are the ones the rest depend
 on; the later ones are the ones that would be easiest to swap out.
 
@@ -214,13 +214,13 @@ remote both edited the same row.
 
 The actual sync runtime — peer discovery, the network transport,
 the conflict-resolution logic, the photo reconciliation pipeline —
-is not in this repo. The schema is shaped to support a peer-to-peer
-model rather than a client-server one, but the runtime that uses
-the schema lives in the product. That separation is deliberate:
-schema design and sync runtime have different stability and review
-demands, and a working sync engine is the kind of thing whose value
-depends on shipping inside a coherent product, not on being readable
-as a reference.
+is not in this repo. It has since shipped in the product as a fully
+local peer-to-peer engine (its shape is described at the end of §8),
+and the schema published here is exactly the contract it runs
+against. The separation is still deliberate: schema design and sync
+runtime have different stability and review demands, and a working
+sync engine is the kind of thing whose value depends on shipping
+inside a coherent product, not on being readable as a reference.
 
 ---
 
@@ -295,12 +295,26 @@ to restore from.
 
 ### Where the seams are
 
-The runner currently catches two specific exception strings. If
+The runner in this cut catches two specific exception strings. If
 SQLite changes the wording of either error message in a future
-version, the runner will incorrectly rethrow. This is a fragility
-worth knowing about. Production has not been bitten by it yet, but
-the right long-term fix is matching on a richer error type if sqflite
-ever exposes one.
+version, the runner will incorrectly rethrow. When this document was
+first written, the note here said "the right long-term fix is
+matching on a richer error type if sqflite ever exposes one" — and
+the production runner has since done exactly that for the case
+sqflite covers: the duplicate-column check now goes through
+sqflite's typed `isDuplicateColumnError()` helper. There is no typed
+helper for `'already exists'`, so that one is still a string match,
+now pinned in a comment to the sqflite_common version it was tested
+against so a dependency bump and the string check get reviewed
+together. Half the fragility retired, half documented — which is
+about how these seams usually close.
+
+The production runner also gained a diagnostic obligation this cut's
+runner doesn't carry: it logs the version trail (`migrating schema
+vX → vY`, and on failure the exact migration and statement index)
+through the local logging layer described in §9. A rethrow here
+aborts startup, and the log is the only artifact that survives to
+explain why.
 
 ### Verified by
 
@@ -313,6 +327,46 @@ has at least one statement and that no registered version exceeds
 `DatabaseService.kSchemaVersion` ([database_service.dart](lib/database/database_service.dart))
 — catching the "bumped the constant but forgot to register vN"
 slip that would silently leave the new migration unrun on upgrade.
+
+### A production postscript: the foreign keys were decorative
+
+The hardest migration the production app has shipped since this cut
+was published is a lesson about SQLite defaults, and it belongs in
+this section even though the migration itself (pottery-domain table
+rebuilds) is not republished here.
+
+SQLite ships with foreign-key enforcement **off**, per connection.
+Every `ON DELETE CASCADE` in a schema is decorative until someone
+runs `PRAGMA foreign_keys = ON`. The production app ran that way
+for thirty-three schema versions. When the pragma was finally
+flipped, it surfaced a dormant corruption: an early table rebuild
+(rename the parent to `pieces_old`, create the new table, copy rows,
+drop the old one) had triggered SQLite's rename-tracking, which
+rewrote the *child* tables' FK clauses to follow the rename — so
+four tables spent years declaring `REFERENCES pieces_old(id)`
+against a table that no longer existed. With enforcement off,
+silent. With enforcement on, every INSERT into those tables fails
+with "no such table."
+
+The repair (production v34) rebuilds each affected child with the
+same rename → create → `INSERT INTO … SELECT` → drop dance, FK
+pointed at the live parent, orphaned rows filtered out. The
+filtering is itself a lesson: the first attempt tried `PRAGMA
+foreign_keys = OFF` at the top of the script, but sqflite wraps
+`onUpgrade` in a transaction and SQLite silently no-ops that pragma
+inside one. A follow-up (production v35) fixed tables whose inline
+`REFERENCES` had no `ON DELETE` clause at all — which defaults to
+RESTRICT, so the moment enforcement went live, "delete this row"
+became a constraint failure on any row with children.
+
+Four transferable rules fell out: enforcement is a per-connection
+pragma, so it belongs in the database's `onConfigure` hook, not in a
+migration; flipping it on a mature schema is a migration-sized event,
+not a one-line change; a table-rebuild migration must account for the
+children, not just the parent; and `PRAGMA foreign_keys` cannot be
+toggled inside a transaction, so a migration runner that wraps
+scripts in one (as sqflite's does) constrains what your repair
+scripts can do.
 
 ---
 
@@ -585,6 +639,29 @@ deleted, then the temp is renamed. If the copy fails partway, the
 original is untouched. Rename is atomic on every supported OS — the
 file system either knows about the new name or doesn't, never both.
 
+Production has hardened this flow twice since this cut was
+published, and both hardenings are worth knowing about:
+
+- **Close before delete.** The sequence in this cut deletes the old
+  database file and calls `DatabaseService.reset()` afterwards. On
+  Windows that order is wrong: the open SQLite handle holds an
+  exclusive lock on the `.db` file, and the delete fails with "being
+  used by another process." The production flow calls `reset()`
+  *first* — close the handle, then delete, then rename. Harmless on
+  Unix, required on Windows.
+- **Validate before swap.** A corrupt backup — or a backup taken by
+  a *newer* app version — used to replace the live database and only
+  fail at the next open, which from the user's perspective bricked
+  the app. The production flow now validates the temp copy through a
+  read-only connection before anything touches the live file: the
+  SQLite header magic, a `PRAGMA quick_check`, and a `PRAGMA
+  user_version` that must be less than or equal to the app's
+  `kSchemaVersion`. Older backups are fine (the migration runner in
+  §3 upgrades them on next open); newer ones are rejected with a
+  message instead of a crash. The version gate is the same
+  philosophy the sync engine applies on the wire (§8): data files
+  only move forward through the migration runner, never backward.
+
 ### Why not the alternatives
 
 Cloud backup (Firebase, S3, etc.) is the obvious alternative and was
@@ -610,10 +687,19 @@ Backups don't currently include media files attached to notes (in
 the production app: photos of pieces; in this cut: any external file
 a note references). The `.db` file stores file paths that point at
 the originating device's filesystem; restoring on a different device
-would leave those references broken. This is a known limitation —
-the v31 sync foundation adds a `syncSourceDevice` column to the
-notes table specifically as the hook a future media-reconciliation
-runtime would read from, but that runtime is not yet built.
+would leave those references broken. This is still a known
+limitation of *backup*. The sync engine, by contrast, has since
+solved it for the device-to-device case — and the way it did so is
+an honest footnote on schema-first design. The v31 sync foundation
+added a `syncSourceDevice` column as the hook a future
+media-reconciliation runtime was expected to read. The runtime that
+actually shipped doesn't use it: each sync delta carries a photo
+manifest, and the receiving device lazily pulls any file that has a
+database row but no file on disk, keyed on the path's existence
+rather than on provenance. The column sits in the schema, nullable
+and unread. That's the accepted cost of designing schema ahead of
+runtime: some anticipatory columns turn out unnecessary, and at 36
+bytes of nullable TEXT, being wrong was nearly free.
 
 ---
 
@@ -679,6 +765,27 @@ contract is local to the sync schema. The second-payoff story
 matters more than the technical fix: it's the same pattern as v31,
 the second time, and it stays cheap for the same reason.
 
+(A numbering honesty note: production's migration numbering has
+moved past this cut. Versions 1–31 here carry their original
+production numbers; after v31, production's own v32–v36 went to
+sync pairing tokens, import provenance, the foreign-key repair
+described in §3, and the sync history log below. The tombstone
+hardening published here keeps the number 36 so its references to
+v31 stay coherent within this cut.)
+
+Production's own recent schema work keeps making the same point.
+Its v32 gave the device registry an authentication credential — one
+nullable `ALTER TABLE ADD COLUMN`. Its v36 answered a diagnosability
+problem: the only persisted sync state was a per-device
+"last synced at" watermark, so "sync has been failing for a week"
+was invisible — the status screen could only describe the current
+moment. The fix is a `sync_log` table recording every sync attempt
+(success or failure, with row/photo/skip/conflict counts), pruned to
+the newest 50 rows on insert so it can never grow unbounded. Its
+`deviceId` is deliberately *not* a foreign key, so history survives
+unpairing the peer. Once again: new table, zero changes to user-data
+tables.
+
 ### Why not the alternatives
 
 The alternative is the retrofit path most apps end up on: ship with
@@ -695,57 +802,230 @@ here is a single user with multiple devices, which is much closer to
 the traditional client-server model with last-writer-wins as a
 reasonable default.
 
+### The runtime that shipped against this contract
+
+When this document was first written, this section ended with "the
+sync runtime is the seam the next major write-up will fill." The
+runtime has since shipped in the product. Its code is still not
+published here — the schema remains the reference — but the shape
+it took is worth recording, because it is a direct test of whether
+the contract above was actually sufficient.
+
+The topology is fully local peer-to-peer: no cloud, no coordinator.
+Every device is simultaneously server and client — each runs an
+embedded HTTP server on an ephemeral port and discovers peers over
+mDNS on the local network. Pairing is a user-mediated PIN handshake:
+the receiving device displays a short-lived PIN, the initiating user
+types it, and a successful match mints a shared token that lands on
+the `sync_trusted_devices` row (the production v32 column). Every
+data endpoint thereafter requires that token as a bearer credential
+— the device registry isn't just bookkeeping; it's the auth store.
+
+The merge is last-writer-wins on `updatedAt`, with three
+refinements the schema anticipated and one it didn't:
+
+- **A per-peer watermark, not a global clock.** "What do I send
+  you" is answered by the `lastSyncedAt` column on the trusted-device
+  row — each peer relationship carries its own cursor, and
+  `updatedAt` is compared per row only after the watermark has
+  scoped the delta.
+- **Clock-skew tolerance.** Two devices' clocks are never exactly
+  aligned; timestamp differences under one second are treated as
+  equal and skipped rather than resolved.
+- **Soft-delete races resolve deterministically.** Because
+  soft-delete bumps `updatedAt` to the same instant as `deletedAt`
+  (the invariant from §2), "local deleted, remote edited later" has
+  a defined winner in both directions — including resurrecting a
+  row when the remote edit post-dates the local delete. Tombstones
+  from `sync_hard_delete_log` are replayed with a re-creation guard:
+  a local row created *after* the tombstone's `deletedAt` is a
+  legitimate re-creation and survives.
+- **The part the schema didn't decide:** conflict staging turned
+  out to be a *mode*, not a mandate. The shipped default is
+  automatic newer-wins; `sync_conflicts` and its side-by-side
+  manual-resolution UI are an opt-in setting. The table is the
+  contract; whether the runtime routes through it belongs to the
+  user.
+
+Two guard rails round it out. Devices refuse to sync unless their
+schema versions match exactly — there is no cross-version
+translation on the wire; the migration runner (§3) is the only
+component allowed to move data between schema shapes. And photo
+files travel outside the row delta entirely, as a manifest plus
+lazy authenticated pulls (§7).
+
+So the contract held, with one honest amendment: the original
+sentence here — any runtime "has to read from `updatedAt`, write to
+`sync_conflicts` on unresolvable collisions, and respect the device
+pairing in `sync_trusted_devices`" — describes the shipped engine
+accurately, provided you read the second clause as conditional on
+the user choosing manual resolution, and the third as having grown
+teeth (pairing is now authentication, not just registration).
+
+---
+
+## 9. Privacy-first observability
+
+*This layer shipped in the production app after this cut was
+published. Like the sync runtime in §8, its code is not republished
+here; it's documented because the architecture story is incomplete
+without it, and because its constraints are the same ones §7
+established.*
+
+### The problem
+
+An offline-first, no-account app has an observability problem shaped
+by its own positioning. There is no server, so there are no server
+logs. There is no telemetry, so there are no crash dashboards. In a
+release build, an uncaught Flutter error simply vanishes — when a
+user reports "it crashed while upgrading," there is nothing to look
+at, and the failure most likely to produce that report is the one
+§3 cares about most: a migration abort during startup.
+
+The obvious fix — always-on crash reporting — contradicts the
+privacy contract the rest of the architecture keeps: *nothing leaves
+the device without an explicit user action* (§7). The architectural
+problem is: how do you get diagnosable failures without breaking
+that contract?
+
+### The decision
+
+Three layers, each inert until something goes wrong or the user
+acts.
+
+**A local diagnostic logger.** A singleton logger writes to an
+in-memory ring buffer (the last ~400 entries) and, on native
+platforms, to a size-capped rotating file pair (256 KB × 2 — a hard
+~512 KB disk bound that still covers several sessions). Web gets
+the memory-only variant through the same conditional-import seam as
+§6. The design decisions are policy, not plumbing: timestamps are
+UTC so entries are unambiguous across DST changes and comparable
+with a peer device's diagnostics; `debug`-level entries reach the
+console and the ring but never the disk (developer noise is not
+diagnostics); writes are serialized so concurrent log calls can't
+interleave lines; and the file sink is contractually non-throwing —
+a broken logger must never take down the code being logged. The
+logger works before it's initialized: early entries buffer in the
+ring and flush to disk once the sink attaches, so the startup
+window — the most failure-prone stretch of the whole app — is never
+unlogged. Getting logs *off* the device is an explicit user action:
+a "share diagnostics" flow hands the log files to the OS share
+sheet, the same posture as §7's backups.
+
+**Opt-in crash reporting, double-gated.** Remote crash reporting
+(Sentry) exists but is gated twice. The build-time gate: the DSN
+arrives as a compile-time define, and when it's absent the feature
+is *compiled out* — the settings toggle isn't rendered and no
+reporting code runs, which is the strongest available meaning of
+"off." The runtime gate: a settings toggle that defaults to off and
+must stay that way (the default is documented in code as a privacy
+promise). What an opted-in crash sends is minimized to error type,
+stack trace, app version, device model, and OS version. No user
+identity, no session tracking, no screenshots — and no breadcrumbs:
+the framework auto-collects UI and navigation crumbs that could
+embed user content, so they are dropped wholesale (count zeroed
+*and* per-crumb discard) rather than trusting a scrubber to catch
+everything.
+
+**A guarded startup path.** The logger initializes first, before
+anything that can fail. Global handlers route uncaught framework and
+async errors into the persistent log. The risky init sequence —
+settings, then crash reporting, then the database open (which is
+where §3's migration runner executes), then the registries and sync
+— is wrapped in a single guard, deliberately ordered so crash
+reporting is live *before* the riskiest step. On failure the app
+doesn't die silently: it renders a zero-dependency error screen (no
+theme service, no database reads — nothing that could itself fail)
+with a copyable dump of the recent log, which includes the migration
+version trail from §3. One subtlety: the guard's catch block
+forwards the error to crash reporting explicitly, because a *caught*
+error never reaches the global handlers.
+
+### Why not the alternatives
+
+Always-on "anonymous" analytics is the industry default and was
+never really on the table — "anonymous" is a claim the user can't
+verify, and this architecture prefers guarantees the user can
+verify (data is local; you can watch the network). Dropping all
+breadcrumbs instead of scrubbing them is the same instinct applied
+at a smaller scale: deletion is verifiable, redaction is a promise.
+
+Firebase Crashlytics would have been the conventional choice for
+the crash-reporting slice. It ties the app to a vendor SDK that
+initializes at startup and can't meaningfully be compiled out; the
+DSN-gate approach means a build without the define contains no
+reporting pathway at all.
+
+A logging framework package would have provided levels, sinks, and
+rotation off the shelf. But the interesting parts of this logger
+are the local decisions — UTC, debug-never-persisted, non-throwing
+sink, the ~512 KB bound — and a framework mostly adds surface area
+around them.
+
 ### Where the seams are
 
-The schema is sync-ready and a runtime exists in the product, but
-neither the runtime nor a sanitized reference version is published
-here. What's in this repo is the *contract* the runtime works
-against — the shape of the data, the soft-delete and timestamp
-conventions, the device registry and conflict staging tables. Any
-runtime that respects this contract is sync-compatible with any
-other.
+Redaction is convention, not enforcement. The logging contract says
+"log identifiers, counts, and error details — never user content,"
+but nothing at runtime scrubs a call site that violates it. The
+protection is review discipline, the same trade-off the
+universal-columns convention makes in §2. A lint rule or a typed
+message wrapper would harden it if the call-site count grows.
 
-This is the seam that the next major architectural write-up will
-fill. The shape of the fill is constrained by the existing schema —
-any sync runtime has to read from `updatedAt`, write to
-`sync_conflicts` on unresolvable collisions, and respect the device
-pairing in `sync_trusted_devices` — but the choice of *how* to do
-those things is the next interesting design space, and one this
-repo deliberately leaves open for now.
+Dropping every breadcrumb means an opted-in crash report arrives
+with no navigation context — sometimes the crash is only
+reproducible if you know the screen path that led there. That's a
+deliberate purchase of privacy at the cost of debuggability, and
+the local log (which the user can choose to share alongside a
+report) is the escape hatch.
+
+And the retention window is tiny by design. Two 256 KB files are
+enough to explain last night's crash, useless for "has this been
+slowly degrading for a month." If long-horizon diagnostics are ever
+needed, the bound is a constant — but raising it should be a
+decision, not drift.
 
 ---
 
 ## A note on what's missing
 
-This document is structured around eight architectural decisions, but
+This document is structured around nine architectural decisions, but
 real architecture isn't really decomposable into a list. The
 decisions interact. The DAO pattern only works because the migration
 runner is reliable. The registries only work because the schema is
 queryable. The sync foundation only works because the universal
-columns were established in v01.
+columns were established in v01. The observability layer earns its
+keep at exactly the moments the others fail — its startup guard
+exists to catch the migration runner's rethrow.
 
 If you read this whole document and the code, what you should come
-away with is not "here are eight clever things" but "here is a
+away with is not "here are nine clever things" but "here is a
 coherent way of thinking about offline-first data architecture, where
-each piece is shaped by the others." The eight headings are
+each piece is shaped by the others." The nine headings are
 pedagogical scaffolding; the architecture is the relationships
 between them.
 
 The relationships are also where this repo is most honest. The full
-app is past v36 with new versions shipping on an ongoing basis; six
-representative versions are published here. The production schema
-covers many tables across several domains; this cut runs four
-(`notes`, `tags`, `note_tags`, `categories`) and adds three more in
-the v31 sync foundation (`sync_trusted_devices`,
-`sync_hard_delete_log`, `sync_conflicts`). The workflow-engine tables
-that the sketched `Pipeline` / `CustomStage` code would query
-(`pipeline_types`, `custom_stages`, plus `pipelineId` / `currentStage`
-columns on notes) are not in this cut — the runnable demonstration of
-their underlying pattern is v26's categories migration. The sync
-runtime exists in some form on the develop branch; none of it is here.
-What's published is enough to demonstrate the patterns and verify the
-case study's claims. It is not enough to clone-and-ship a competing
-product, and that's deliberate.
+app is at schema v36 with new versions shipping on an ongoing basis;
+six representative versions are published here. The published
+numbering matches production through v31; after that, production's
+own v32–v36 went to sync pairing tokens, import provenance, the
+foreign-key repair (§3), and the sync history log (§8), so the
+tombstone-hardening migration published here as v36 carries that
+number for this cut's internal coherence rather than as a claim
+about production's v36. The production schema covers many tables
+across several domains; this cut runs four (`notes`, `tags`,
+`note_tags`, `categories`) and adds three more in the v31 sync
+foundation (`sync_trusted_devices`, `sync_hard_delete_log`,
+`sync_conflicts`). The workflow-engine tables that the sketched
+`Pipeline` / `CustomStage` code would query (`pipeline_types`,
+`custom_stages`, plus `pipelineId` / `currentStage` columns on notes)
+are not in this cut — the runnable demonstration of their underlying
+pattern is v26's categories migration. The sync runtime and the
+observability layer have shipped in the product; they are described
+in §8 and §9, but none of their code is here. What's published is
+enough to demonstrate the patterns and verify the case study's
+claims. It is not enough to clone-and-ship a competing product, and
+that's deliberate.
 
 ---
 
