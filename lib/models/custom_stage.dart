@@ -30,8 +30,8 @@ class CustomStage {
         'name':      name,
         'emoji':     emoji,
         'sortOrder': sortOrder,
-        'createdAt': createdAt.toIso8601String(),
-        'updatedAt': updatedAt.toIso8601String(),
+        'createdAt': createdAt.toUtc().toIso8601String(),
+        'updatedAt': updatedAt.toUtc().toIso8601String(),
       };
 
   CustomStage copyWith({String? name, String? emoji, int? sortOrder}) =>
@@ -41,6 +41,6 @@ class CustomStage {
         emoji:     emoji ?? this.emoji,
         sortOrder: sortOrder ?? this.sortOrder,
         createdAt: createdAt,
-        updatedAt: DateTime.now(),
+        updatedAt: DateTime.now().toUtc(),
       );
 }

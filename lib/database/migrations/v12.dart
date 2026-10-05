@@ -1,9 +1,17 @@
 /// v12 — Notes v2: rich metadata, archival state, and pinning.
 ///
-/// Demonstrates the "one ALTER TABLE per column" pattern SQLite requires.
-/// Each ALTER is its own statement so that a partial failure mid-migration
-/// leaves the database in a recoverable state — every prior ALTER has
-/// already committed by the time the next one runs.
+/// Demonstrates the "one ALTER TABLE per column" pattern SQLite requires:
+/// ALTER TABLE ADD COLUMN adds exactly one column per statement.
+///
+/// Keeping each ALTER in its own string also matters to the runner. Its
+/// idempotency catch works per statement, so on a database that already
+/// has some of these columns, each duplicate-column error is swallowed
+/// on its own and the remaining ALTERs still run.
+///
+/// It does NOT mean earlier ALTERs survive a later failure. sqflite runs
+/// the whole upgrade in one transaction, so if any statement fails, every
+/// statement in the upgrade rolls back and the next open retries from the
+/// old version (see test/migration_transaction_test.dart).
 ///
 /// Note on defaults: NOT NULL columns added to a table with existing rows
 /// must have a DEFAULT, otherwise the ALTER fails on populated databases.

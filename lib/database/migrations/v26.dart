@@ -1,10 +1,16 @@
 /// v26 — User-customizable categories.
 ///
-/// Replaces the hardcoded NoteCategory enum with a DB-driven categories
-/// table. The three built-in categories are seeded with IDs that match
-/// the existing `category` TEXT values on notes, so no data migration
-/// is needed for existing rows — every note's category string already
-/// resolves to a valid categories.id after this migration runs.
+/// Replaces a hardcoded NoteCategory enum with a DB-driven categories
+/// table. The three built-in rows are seeded with IDs equal to the enum's
+/// persisted string names ('personal', 'work', 'reference'), so any row
+/// that stored one of those strings resolves to a valid categories.id
+/// with no data migration.
+///
+/// In this published cut, no migration creates a `category` column on
+/// `notes`: the toy domain keeps only the table and its seeds. The point
+/// on display is the seeding trick, which only works because the enum
+/// was persisted by name rather than by `.index` (see ARCHITECTURE.md §1
+/// and BuiltInStage.dbName for the same rule).
 ///
 /// This is the architectural pivot that makes the workflow engine
 /// configurable: stages, transitions, and now categories all live as
@@ -22,8 +28,8 @@ const List<String> v26 = [
   )''',
 
   // ── Seed the three built-in categories ────────────────────────────
-  // IDs deliberately match the existing notes.category TEXT values so
-  // that all existing notes automatically resolve to the correct row.
+  // IDs deliberately match the enum's persisted string names, so rows
+  // that stored those strings resolve to the correct category row.
 
   '''INSERT OR IGNORE INTO categories (id,name,icon,color,isBuiltIn,sortOrder,createdAt,updatedAt) VALUES (
     'personal','Personal','📔','#6B7FD7',

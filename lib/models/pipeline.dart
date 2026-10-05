@@ -2,8 +2,10 @@ import 'dart:convert';
 
 /// A user-configurable workflow pipeline.
 ///
-/// The built-in pipelines are seeded in the DB at migration v26 and
-/// cannot be deleted. Users can create additional pipelines with any
+/// Built-in pipelines (`isBuiltIn = 1`) are seeded by the production
+/// app's later migrations, which aren't in this published cut (no
+/// migration here creates `pipeline_types`; v26 creates `categories`).
+/// They cannot be deleted. Users can create additional pipelines with any
 /// ordered subset of stage IDs (built-in stage dbNames or custom stage
 /// UUIDs).
 ///
@@ -54,8 +56,8 @@ class Pipeline {
     'stages':    jsonEncode(stages),
     'isBuiltIn': isBuiltIn ? 1 : 0,
     'sortOrder': sortOrder,
-    'createdAt': createdAt.toIso8601String(),
-    'updatedAt': updatedAt.toIso8601String(),
+    'createdAt': createdAt.toUtc().toIso8601String(),
+    'updatedAt': updatedAt.toUtc().toIso8601String(),
   };
 
   Pipeline copyWith({

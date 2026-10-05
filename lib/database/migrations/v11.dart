@@ -1,8 +1,10 @@
 /// v11 — Tags and note-tag join.
 ///
-/// Adds many-to-many tagging to notes. Three new tables in one migration
-/// because they're meaningless apart: a tag with no notes is dead data,
-/// and a join row with no tag or note is invalid by definition.
+/// Adds many-to-many tagging to notes: two new tables (`tags` and the
+/// `note_tags` join) plus an index on each side of the join, four
+/// statements in one migration. They ship together because they're
+/// meaningless apart: a tag with no notes is dead data, and a join row
+/// with no tag or note is invalid by definition.
 const List<String> v11 = [
   '''CREATE TABLE IF NOT EXISTS tags (
     id        TEXT PRIMARY KEY,

@@ -6,13 +6,13 @@
 /// of a pipeline don't need to know whether a given stage is built-in
 /// or custom — both kinds resolve to a StageDefinition the same way.
 class StageDefinition {
-  final String id;        // DB key: built-in dbName (e.g. 'throwing') or UUID
-  final String name;      // Human-readable, e.g. 'Bisque Firing'
-  final String shortName; // Short label, e.g. 'Bisque'
+  final String id;        // DB key: built-in dbName (e.g. 'in_progress') or UUID
+  final String name;      // Human-readable, e.g. 'Under Review'
+  final String shortName; // Short label; built-ins reuse name, custom stages truncate
   final String emoji;
   final bool isBuiltIn;
-  final bool isDead;      // true only for 'died'
-  final bool isDone;      // true for 'finished' and 'sold'
+  final bool isDead;      // ended without completing; no built-in toy stage sets it
+  final bool isDone;      // completed; true for 'approved' and 'archived'
 
   const StageDefinition({
     required this.id,

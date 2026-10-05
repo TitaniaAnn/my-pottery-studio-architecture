@@ -32,7 +32,7 @@ class TransitionEvent {
       'id':        id,
       'entityId':  entityId,
       'stage':     stage,
-      'timestamp': timestamp.toIso8601String(),
+      'timestamp': timestamp.toUtc().toIso8601String(),
     };
   }
 }

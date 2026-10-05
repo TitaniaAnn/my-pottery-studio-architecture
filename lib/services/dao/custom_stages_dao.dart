@@ -28,7 +28,7 @@ class CustomStagesDao {
     required String emoji,
   }) async {
     final db = await _db.database;
-    final now = DateTime.now();
+    final now = DateTime.now().toUtc();
     final stage = CustomStage(
       id:        const Uuid().v4(),
       name:      name,
@@ -57,7 +57,17 @@ class CustomStagesDao {
   }
 
   /// Converts a [CustomStage] to a [StageDefinition] for the registry.
-  /// The truncated shortName keeps custom stages visually consistent
-  /// with built-in ones, which all have hand-tuned short labels.
+  /// User-entered names can be any length, so shortName is truncated
+  /// to keep custom stages as compact as the built-ins, whose display
+  /// names are all short enough to double as their short labels.
   static StageDefinition toDefinition(CustomStage s) {
-    final short = s.name.length > 12 ? '${s.name.subst
+    final short = s.name.length > 12 ? '${s.name.substring(0, 11)}…' : s.name;
+    return StageDefinition(
+      id:        s.id,
+      name:      s.name,
+      shortName: short,
+      emoji:     s.emoji,
+      isBuiltIn: false,
+    );
+  }
+}

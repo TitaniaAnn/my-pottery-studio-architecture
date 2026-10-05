@@ -43,20 +43,23 @@ match the strings the old enum used, so existing rows that reference
 the enum value resolve to the new row without a data backfill.
 
 [Migration v26](lib/database/migrations/v26.dart) is the published
-example. Before v26, the app had a hardcoded `NoteCategory` enum with
-three values: personal, work, reference. v26 creates a `categories`
-table and seeds those three rows with `id` values that match the
-existing enum strings. Notes that were tagged `'work'` at the string
-level now reference `categories.id = 'work'` after the migration —
-no data migration needed.
+example. It replaces a hardcoded `NoteCategory` enum with three
+values (personal, work, reference): v26 creates a `categories` table
+and seeds those three rows with `id` values equal to the enum's
+persisted string names. Any row that stored `'work'` now resolves to
+`categories.id = 'work'`, with no data migration.
 
-That seeding trick is the bit worth pausing on. It only works because
-the original `notes.category` column was a TEXT field holding the
-enum's string name, not an INTEGER holding the enum's `.values`
-index. If it had been an integer, the migration would have needed
-either a `categories.legacyIndex` column or a row-by-row
-backfill — both more painful than the actual migration, which is
-four SQL statements (one CREATE TABLE plus three INSERT OR IGNOREs).
+That seeding trick is the bit worth pausing on. It only works if the
+enum was persisted as its string name in a TEXT column, not as an
+INTEGER holding its `.values` index. If it had been an integer, the
+migration would have needed either a `categories.legacyIndex` column
+or a row-by-row backfill — both more painful than the actual
+migration, which is four SQL statements (one CREATE TABLE plus three
+INSERT OR IGNOREs). In the production app the referencing column
+exists on the entity table; this toy cut keeps only the `categories`
+table and its seeds, so no published migration creates a `category`
+column on `notes`. The by-name persistence rule itself is visible in
+[`BuiltInStage.dbName`](lib/models/built_in_stage.dart).
 
 ### Same pattern, larger scale (sketched, not in this cut)
 
@@ -168,8 +171,8 @@ columns, established in [v01](lib/database/migrations/v01.dart):
 ```
 id        TEXT PRIMARY KEY    — UUID, not auto-increment
 userId    TEXT                — nullable, ready for a future backend
-createdAt TEXT NOT NULL       — ISO 8601 timestamp
-updatedAt TEXT NOT NULL       — ISO 8601 timestamp, bumped on every write
+createdAt TEXT NOT NULL       — ISO 8601 timestamp, UTC
+updatedAt TEXT NOT NULL       — ISO 8601 timestamp, UTC, bumped on every write
 deletedAt TEXT                — nullable; soft-delete pattern
 ```
 These five columns are not optional. They are the universal-columns
@@ -189,6 +192,13 @@ Each column does specific work:
   yet.
 - **createdAt and updatedAt** are what a sync layer uses to detect
   changes. Without timestamps, sync can't tell which version is newer.
+  They're written in UTC (`DateTime.now().toUtc()`, so the stored
+  string ends in `Z`). A local time with no offset names a different
+  instant on a peer in another time zone, or on the same device
+  either side of a DST change, and last-writer-wins would compare the
+  wrong instants. The one exception in this cut is v26's seed rows,
+  which use SQLite's `datetime('now')`: also UTC, but in SQLite's
+  space-separated format with no `Z`.
 - **Soft-delete via deletedAt** means deletions can be replicated to
   peer devices. Hard-deleted rows just disappear — the peer has no way
   to learn the row was deleted, only that it's no longer present,
@@ -270,21 +280,32 @@ This is what makes the system idempotent in the strict sense: running
 a migration twice produces the same end state as running it once. The
 end state is what matters; the path doesn't have to be linear.
 
-In practice, this protects against three failure modes:
+In practice, this covers two failure modes:
 
 1. **Skipped versions.** A user upgrades through five versions at
    once. The runner iterates from `oldVersion + 1` to `newVersion`,
    running every migration in sequence. None of them assume the
    immediate previous version's state.
-2. **Partial migrations.** A migration script has multiple statements;
-   the third statement fails. The first two have already committed.
-   On the next launch, the runner re-runs the same migration; the
-   first two statements raise idempotency errors (caught), the third
-   gets another shot.
-3. **State drift.** A user's database has a column the migration is
+2. **State drift.** A user's database has a column the migration is
    trying to add, because of a long-resolved bug in an earlier
    release. The migration runs, hits the duplicate-column error,
    continues.
+
+A third case, the partial migration, is handled by sqflite rather
+than by the catch, and an earlier version of this document got it
+wrong. It said that when a migration's third statement fails, the
+first two "have already committed" and get re-run harmlessly next
+launch. They don't commit. sqflite runs the entire `onUpgrade` call
+inside one transaction, spanning every version from `oldVersion + 1`
+to `newVersion`, and sets `user_version` inside that same
+transaction. One failing statement rolls back the whole upgrade,
+including earlier versions in the same launch, and the next open
+starts again from the old version with nothing half-applied.
+[`test/migration_transaction_test.dart`](test/migration_transaction_test.dart)
+pins this down against the sqflite version this repo resolves
+(sqflite 2.4.2+1, sqflite_common 2.5.6+1). One consequence, which
+the postscript below runs into: transaction-hostile statements like
+`PRAGMA foreign_keys` can't be used inside a migration.
 
 ### Why not the alternatives
 
@@ -343,14 +364,20 @@ turned out to be reusable infrastructure, not a one-off.
 ### Verified by
 
 [`test/migration_idempotency_test.dart`](test/migration_idempotency_test.dart)
-exercises the contract directly: it re-runs every v36 statement on
-top of an already-current schema and asserts that no exception
-escapes. It also asserts that every version registered in
-`SchemaScripts.migrations` ([schema_scripts.dart](lib/database/schema_scripts.dart))
-has at least one statement and that no registered version exceeds
+exercises the contract directly. It drives the runner's catch block
+with statements that hit each recognized error (re-running v12's
+`ADD COLUMN`s, re-creating an existing table and index) and with one
+that fails for an unrelated reason, which must be rethrown. It
+re-runs every v36 statement on top of an already-current schema and
+asserts that no exception escapes. And it asserts that
 `DatabaseService.kSchemaVersion` ([database_service.dart](lib/database/database_service.dart))
-— catching the "bumped the constant but forgot to register vN"
-slip that would silently leave the new migration unrun on upgrade.
+equals the highest version registered in `SchemaScripts.migrations`
+([schema_scripts.dart](lib/database/schema_scripts.dart)), and that
+every registered version has at least one statement. That catches
+the "bumped the constant to NN but forgot to register vNN" slip,
+which would silently leave the new migration unrun on upgrade. It
+doesn't check that every version below the top is registered: gaps
+are expected, because this repo publishes a subset.
 
 ### A production postscript: the foreign keys were decorative
 
@@ -664,40 +691,55 @@ reason — the OS conventions for "share a file" differ:
   picks Files, AirDrop, email, iCloud Drive, etc. The app never knows
   where the file ends up.
 - **Desktop (Windows/macOS/Linux):** folder picker via `file_picker`.
-  The app copies the `.db` file to the chosen folder.
+  The app writes the backup to the chosen folder.
 
-Restore is uniform: file picker, validate the extension, copy to a
-temp file, atomic rename over the live database, call
-`DatabaseService.reset()` to drop the cached connection.
+Either way, the exported file is a checkpointed snapshot, not a raw
+copy of the live file. If the database is in WAL mode, recent commits
+can still be sitting in the `-wal` sidecar, and copying the main file
+alone would silently leave them out. Export runs `PRAGMA
+wal_checkpoint(TRUNCATE)` first, which moves those pages into the
+main file (and is a no-op outside WAL mode), then copies. `VACUUM
+INTO` would also work, but needs SQLite 3.27+, which older Android
+system builds don't have.
+
+Restore is uniform across platforms: file picker, copy to a temp file
+beside the live database, validate the copy, then swap it in.
 
 The atomic-rename pattern is the architecturally interesting bit. The
-file is copied to `database.db.tmp` first, then the original is
-deleted, then the temp is renamed. If the copy fails partway, the
+file is copied to `database.db.tmp` first, checked, and only then
+renamed over the live file. If anything fails before the rename, the
 original is untouched. Rename is atomic on every supported OS — the
 file system either knows about the new name or doesn't, never both.
 
-Production has hardened this flow twice since this cut was
-published, and both hardenings are worth knowing about:
+Both of the steps around that rename were added after this cut was
+first published, mirroring hardenings the production app made:
 
-- **Close before delete.** The sequence in this cut deletes the old
-  database file and calls `DatabaseService.reset()` afterwards. On
-  Windows that order is wrong: the open SQLite handle holds an
-  exclusive lock on the `.db` file, and the delete fails with "being
-  used by another process." The production flow calls `reset()`
-  *first* — close the handle, then delete, then rename. Harmless on
-  Unix, required on Windows.
-- **Validate before swap.** A corrupt backup — or a backup taken by
-  a *newer* app version — used to replace the live database and only
+- **Validate before swap.** A corrupt backup, or a backup taken by
+  a *newer* app version, used to replace the live database and only
   fail at the next open, which from the user's perspective bricked
-  the app. The production flow now validates the temp copy through a
-  read-only connection before anything touches the live file: the
-  SQLite header magic, a `PRAGMA quick_check`, and a `PRAGMA
-  user_version` that must be less than or equal to the app's
-  `kSchemaVersion`. Older backups are fine (the migration runner in
-  §3 upgrades them on next open); newer ones are rejected with a
-  message instead of a crash. The version gate is the same
-  philosophy the sync engine applies on the wire (§8): data files
-  only move forward through the migration runner, never backward.
+  the app. The temp copy is now validated through a read-only
+  connection before anything touches the live file: the SQLite header
+  magic, a `PRAGMA quick_check`, and a `PRAGMA user_version` that must
+  be less than or equal to the app's `kSchemaVersion`. Older backups
+  are fine (the migration runner in §3 upgrades them on next open);
+  newer ones are rejected with a message instead of a crash. The
+  version gate is the same philosophy the sync engine applies on the
+  wire (§8): data files only move forward through the migration
+  runner, never backward.
+- **Close before delete, sidecars included.** The connection is
+  closed with `DatabaseService.reset()` *before* the old file is
+  deleted. On Windows the other order fails: the open SQLite handle
+  locks the `.db` file, and the delete fails with "being used by
+  another process." The live file's `-wal`, `-shm` and `-journal`
+  sidecars are deleted with it, because a stale `-wal` beside the
+  restored file would be replayed into it on the next open, and a
+  stale `-journal` would be treated as a hot journal and rolled back
+  into it.
+
+[`test/local_backup_test.dart`](test/local_backup_test.dart) covers
+the rejections (a non-SQLite file, a too-new `user_version`), a
+successful restore that clears stale sidecars, and an export taken
+while the newest row exists only in the WAL.
 
 ### Why not the alternatives
 

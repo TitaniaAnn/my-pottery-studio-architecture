@@ -13,11 +13,16 @@
 ///   2. Drop the non-unique index from v31.
 ///   3. Create the UNIQUE index.
 ///
-/// The dedupe DELETE keeps the lowest `_rowid_` per group, which
-/// preserves the earliest tombstone's `pushedAt` state. Losing one
-/// would silently drop a deletion from the next outbound delta — an
-/// invariant violation a sync runtime can't recover from after the
-/// fact.
+/// The dedupe DELETE keeps exactly one row per group: the one with the
+/// lowest `_rowid_`. That's usually the earliest insert, but SQLite
+/// doesn't guarantee rowids follow insert order: the highest rowid can
+/// be handed out again after its row is deleted, and VACUUM may
+/// renumber rowids on a table like this one that has no INTEGER
+/// PRIMARY KEY. So the survivor's `pushedAt` isn't guaranteed to be
+/// the earliest tombstone's. What matters is that one survives: losing
+/// every copy would silently drop a deletion from the next outbound
+/// delta, an invariant violation a sync runtime can't recover from
+/// after the fact.
 ///
 /// We use `_rowid_` (not `rowid`) because the table has a user column
 /// called `rowId` and SQLite identifiers are case-insensitive — the

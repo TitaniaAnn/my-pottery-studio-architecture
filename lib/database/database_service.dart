@@ -43,9 +43,11 @@ class DatabaseService {
   /// Current schema version. Bump this when adding a new vNN.dart
   /// migration file and registering it in [SchemaScripts.migrations].
   ///
-  /// Exposed as a constant so tests can iterate `for (var v = 1; v <=
-  /// kSchemaVersion; v++)` to assert every version is registered, which
-  /// catches the "bumped the version but forgot to register vN" slip.
+  /// Must equal the highest key in [SchemaScripts.migrations]. Gaps
+  /// below it are expected (this repo publishes a subset of versions),
+  /// so tests assert the top end: that `vNN` for `kSchemaVersion = NN`
+  /// is registered, which catches the "bumped the version but forgot
+  /// to register vNN" slip.
   static const int kSchemaVersion = 36;
 
   static final DatabaseService instance = DatabaseService._init();
@@ -106,10 +108,27 @@ class DatabaseService {
   ///
   /// The try/catch around [db.execute] is what makes the whole system
   /// idempotent. See the class-level docs for the full explanation.
-  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+  ///
+  /// sqflite calls this inside a single transaction that spans every
+  /// version from `oldVersion + 1` to `newVersion`. If any statement
+  /// rethrows, the whole upgrade rolls back, `user_version` stays at
+  /// `oldVersion`, and the next open retries from there.
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) =>
+      runMigrations(db, oldVersion, newVersion);
+
+  /// The migration loop behind [_onUpgrade], exposed so tests can drive
+  /// the idempotency catch with their own scripts. Production code only
+  /// reaches it through [_onUpgrade].
+  @visibleForTesting
+  static Future<void> runMigrations(
+    DatabaseExecutor db,
+    int oldVersion,
+    int newVersion, {
+    Map<int, List<String>> migrations = SchemaScripts.migrations,
+  }) async {
     for (int i = oldVersion + 1; i <= newVersion; i++) {
-      if (SchemaScripts.migrations.containsKey(i)) {
-        for (String script in SchemaScripts.migrations[i]!) {
+      if (migrations.containsKey(i)) {
+        for (String script in migrations[i]!) {
           try {
             await db.execute(script);
           } on DatabaseException catch (e) {
@@ -165,8 +184,8 @@ class DatabaseService {
 
   // ── Lifecycle ──────────────────────────────────────────────────
 
-  Future close() async {
-    final db = await instance.database;
-    db.close();
-  }
+  /// Closes the connection and drops the cached handle, so the next
+  /// [database] call opens a fresh one instead of returning a closed
+  /// connection. Same as [reset]; kept as the instance-level name.
+  Future<void> close() => reset();
 }
