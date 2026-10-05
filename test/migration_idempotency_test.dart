@@ -5,32 +5,37 @@
 //    it once. The end state is what matters; the path doesn't have to
 //    be linear."
 //
-// This file is the verifier. Three groups, three claims:
+// This file is the verifier. Three claims:
 //
-//   1. The runner catches the two specific exception strings the
-//      production catch block recognizes — `'duplicate column name'`
-//      and `'already exists'` — without rethrowing. This is the
-//      property that makes ALTER TABLE ADD COLUMN and CREATE TABLE
-//      (without IF NOT EXISTS) re-runnable in the wild.
+//   1. The runner catches the two specific exception strings its catch
+//      block recognizes — `'duplicate column name'` and `'already
+//      exists'` — without rethrowing, and rethrows everything else.
+//      The tests drive [DatabaseService.runMigrations] (the loop behind
+//      `_onUpgrade`) with scripts that hit each case: re-running v12's
+//      ALTER TABLE ADD COLUMNs, re-running a CREATE TABLE and a CREATE
+//      INDEX without IF NOT EXISTS, and a statement that fails for an
+//      unrelated reason.
 //   2. v36's statements (the most recently published migration) are
-//      individually re-runnable on top of an already-current schema.
-//      Migrations whose docstrings claim idempotency (v36 explicitly
-//      uses `IF NOT EXISTS` and a guarded DELETE) are tested for
-//      strict re-runnability; older `ALTER TABLE ADD COLUMN`
-//      migrations are not, because their re-run safety comes from
-//      the runner's catch block, not from the SQL itself.
-//   3. Every version up to [kSchemaVersion] is registered in
-//      [SchemaScripts.migrations]. This catches the "bumped
-//      kSchemaVersion but forgot to register vN" slip, which would
-//      silently leave the new migration unrun on upgrade.
+//      individually re-runnable on top of an already-current schema
+//      with no help from the runner: v36 uses `IF NOT EXISTS`,
+//      `IF EXISTS` and a DELETE that's a no-op without duplicates.
+//   3. `kSchemaVersion` equals the highest registered migration and
+//      every registered version has statements. Gaps below the top are
+//      expected (this repo publishes a subset), so the check is on the
+//      top end: it catches the "bumped kSchemaVersion to NN but forgot
+//      to register vNN" slip, which would silently leave vNN unrun.
 //
-// Plus a focused regression test for v36's dedup logic — the DELETE
-// keeps lowest rowid per (tableName, rowId) group, and uses `_rowid_`
-// (not `rowid`) because the user column `rowId` shadows the implicit
-// name and the DELETE would otherwise silently no-op.
+// Plus focused regression tests for v36's dedup DELETE (one survivor
+// per (tableName, rowId) group; `_rowid_`, not `rowid`, because the
+// user column `rowId` shadows the implicit name and the DELETE would
+// otherwise silently no-op) and for its unique index.
+//
+// What happens when a migration fails partway is a separate question,
+// covered in migration_transaction_test.dart.
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_pottery_studio_architecture/database/database_service.dart';
+import 'package:my_pottery_studio_architecture/database/migrations/v12.dart';
 import 'package:my_pottery_studio_architecture/database/schema_scripts.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -40,6 +45,48 @@ void main() {
     databaseFactory = databaseFactoryFfi;
     DatabaseService.testDbPath = ':memory:';
     await DatabaseService.resetForTests();
+  });
+
+  group('§3 runner catch block', () {
+    test("re-adding existing columns is caught as 'duplicate column name'",
+        () async {
+      final db = await DatabaseService.instance.database;
+      // The schema is already at kSchemaVersion, so every column v12
+      // adds exists. Re-running v12 through the runner hits the
+      // duplicate-column error on each ALTER; the catch must swallow
+      // all seven.
+      await DatabaseService.runMigrations(db, 11, 12,
+          migrations: const {12: v12});
+
+      final columns = (await db.rawQuery('PRAGMA table_info(notes)'))
+          .map((r) => r['name'])
+          .toList();
+      expect(columns.where((c) => c == 'pinned'), hasLength(1));
+    });
+
+    test("re-creating existing objects is caught as 'already exists'",
+        () async {
+      final db = await DatabaseService.instance.database;
+      // Deliberately without IF NOT EXISTS, so SQLite raises.
+      await DatabaseService.runMigrations(db, 0, 1, migrations: const {
+        1: [
+          'CREATE TABLE notes (id TEXT PRIMARY KEY)',
+          'CREATE INDEX idx_note_tags_note ON note_tags(noteId)',
+        ],
+      });
+    });
+
+    test('any other DatabaseException is rethrown', () async {
+      final db = await DatabaseService.instance.database;
+      // The catch is selective: an error that doesn't mean "already
+      // applied" must abort the upgrade, not be swallowed.
+      await expectLater(
+        DatabaseService.runMigrations(db, 0, 1, migrations: const {
+          1: ['ALTER TABLE no_such_table ADD COLUMN x TEXT'],
+        }),
+        throwsA(isA<DatabaseException>()),
+      );
+    });
   });
 
   group('idempotency for migrations that document the contract', () {
@@ -61,12 +108,18 @@ void main() {
       }
     });
 
-    test('every version up to kSchemaVersion is registered', () async {
-      // Catches a "bumped kSchemaVersion but forgot to register vN" slip.
-      // Gaps in the published version sequence are expected (this repo
-      // publishes a representative subset, not the full history) — the
-      // assertion is "every registered key has at least one statement,"
-      // not "every version 1..N is present."
+    test('kSchemaVersion matches the highest registered migration',
+        () async {
+      // Catches a "bumped kSchemaVersion to NN but forgot to register
+      // vNN" slip. Gaps in the published version sequence are expected
+      // (this repo publishes a representative subset, not the full
+      // history), so this checks the top end and that every registered
+      // key has statements, not that every version 1..N is present.
+      expect(SchemaScripts.migrations.containsKey(DatabaseService.kSchemaVersion),
+          isTrue,
+          reason: 'kSchemaVersion is ${DatabaseService.kSchemaVersion} but '
+              'v${DatabaseService.kSchemaVersion} is not registered — '
+              'upgrades would set user_version without running it');
       for (final entry in SchemaScripts.migrations.entries) {
         expect(entry.value, isNotEmpty,
             reason: 'v${entry.key} is registered but has no statements');
@@ -94,8 +147,10 @@ void main() {
         () async {
       // Simulate a pre-v36 state where multiple rows for the same
       // (tableName, rowId) accumulated. The v36 DELETE keeps the row
-      // with the lowest sqlite rowid — typically the earliest insert,
-      // which preserves the unpushed `pushedAt` state if any.
+      // with the lowest `_rowid_` in each group. SQLite doesn't promise
+      // rowids follow insert order in general, but on this fresh,
+      // never-deleted-from table they do, so the expected survivor is
+      // deterministic here.
       final db = await DatabaseService.instance.database;
       // First drop the unique index installed by v36 so we can insert
       // duplicates; the DELETE statement should still leave one row.
@@ -144,8 +199,8 @@ void main() {
           whereArgs: ['note_tags', 'tag-x']);
       expect(remaining, hasLength(1));
       expect(remaining.single['id'], 'id-1',
-          reason: 'Lowest rowid wins → first inserted row survives, '
-              'preserving its (here null) pushedAt state');
+          reason: 'Lowest _rowid_ wins; on this fresh table that is the '
+              'first inserted row');
     });
   });
 

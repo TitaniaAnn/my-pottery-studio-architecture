@@ -11,9 +11,14 @@
 ///
 ///   id        — UUID primary key (no auto-increment, no merge collisions)
 ///   userId    — nullable, so adding a backend later requires no migration
-///   createdAt — ISO 8601, never null
-///   updatedAt — ISO 8601, never null, bumped on every copyWith
-///   deletedAt — ISO 8601, null until soft-delete
+///   createdAt — ISO 8601 UTC, never null
+///   updatedAt — ISO 8601 UTC, never null, bumped on every copyWith
+///   deletedAt — ISO 8601 UTC, null until soft-delete
+///
+/// Timestamps are stored in UTC (`...Z`) because last-writer-wins
+/// compares `updatedAt` across devices; a local time with no offset
+/// names a different instant in every time zone. [toMap] converts to
+/// UTC, so a caller passing a local DateTime still stores a UTC string.
 ///
 /// These five columns make the table sync-ready, audit-friendly, and
 /// safe to soft-delete without losing history.
@@ -85,9 +90,9 @@ class Note {
       'pipelineId':   pipelineId,
       'currentStage': currentStage,
       'userId':       userId,
-      'createdAt':    createdAt.toIso8601String(),
-      'updatedAt':    updatedAt.toIso8601String(),
-      'deletedAt':    deletedAt?.toIso8601String(),
+      'createdAt':    createdAt.toUtc().toIso8601String(),
+      'updatedAt':    updatedAt.toUtc().toIso8601String(),
+      'deletedAt':    deletedAt?.toUtc().toIso8601String(),
     };
   }
 
@@ -106,7 +111,7 @@ class Note {
       currentStage: currentStage ?? this.currentStage,
       userId:       userId,
       createdAt:    createdAt,
-      updatedAt:    DateTime.now(),
+      updatedAt:    DateTime.now().toUtc(),
       deletedAt:    deletedAt    ?? this.deletedAt,
     );
   }

@@ -26,7 +26,7 @@ class NotesDao {
     String body = '',
   }) async {
     final db = await _db.database;
-    final now = DateTime.now();
+    final now = DateTime.now().toUtc();
     final note = Note(
       id:           const Uuid().v4(),
       title:        title,
@@ -94,9 +94,14 @@ class NotesDao {
   /// last-writer-wins sync resolves a "local soft-deleted, remote
   /// edited" race by comparing `updatedAt`s, and a delete that fails
   /// to bump `updatedAt` would lose to any later edit on the peer.
+  ///
+  /// The timestamp is UTC (the stored string ends in `Z`). A local
+  /// time without an offset means a different instant on a peer in
+  /// another zone, or on the same device either side of a DST change,
+  /// and last-writer-wins would compare the wrong instants.
   Future<void> softDelete(String id) async {
     final db = await _db.database;
-    final now = DateTime.now().toIso8601String();
+    final now = DateTime.now().toUtc().toIso8601String();
     await db.update(
       'notes',
       {

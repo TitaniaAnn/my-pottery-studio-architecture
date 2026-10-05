@@ -23,7 +23,7 @@ lib/
 │   ├── schema_scripts.dart                ← version → SQL registry
 │   └── migrations/
 │       ├── v01.dart                       ← notes table, universal columns
-│       ├── v11.dart                       ← tags + note_tags join (3 statements)
+│       ├── v11.dart                       ← tags + note_tags join (4 statements)
 │       ├── v12.dart                       ← bulk ALTER TABLE pattern (notes v2)
 │       ├── v26.dart                       ← categories table replacing enum
 │       ├── v31.dart                       ← sync foundation (3 new tables, 1 ALTER)
@@ -38,20 +38,23 @@ lib/
 │   └── transition_event.dart              ← immutable lifecycle audit entry
 │
 └── services/                              # DAOs + in-memory registries + local backup
-    ├── local_backup_service.dart          ← atomic copy-then-rename restore
+    ├── local_backup_service.dart          ← WAL-safe export, validate-then-swap restore
     ├── pipeline_registry.dart             ← in-memory cache, synchronous lookup
     ├── stage_registry.dart                ← built-in (from enum) + custom (from DB) unified
     └── dao/
         ├── notes_dao.dart                 ← simple CRUD pattern, soft-delete with LWW invariant
         ├── pipelines_dao.dart             ← sketch — queries pipeline_types, no migration creates it
-        └── custom_stages_dao.dart         ← sketch — same caveat; file is also currently truncated
+        └── custom_stages_dao.dart         ← sketch — same caveat
 
 test/                                      # Verifies the contract claims in ARCHITECTURE.md
-├── migration_idempotency_test.dart        ← §3 idempotency, v36 dedup + unique-index, registration
-└── dao_soft_delete_test.dart              ← §2 / §8 last-writer-wins invariant
+├── migration_idempotency_test.dart        ← §3 runner catch block, v36 dedup + unique index, version registration
+├── migration_transaction_test.dart        ← §3 a failed upgrade rolls back as a whole
+├── dao_soft_delete_test.dart              ← §2 / §8 last-writer-wins invariant, UTC timestamps
+├── database_service_test.dart             ← close() reopens cleanly
+└── local_backup_test.dart                 ← §7 restore validation, sidecars, WAL-safe export
 ```
-26 Dart files in total — 24 under `lib/` (1 entrypoint, 6 in
-`database/`, 6 migrations, 6 models, 5 in `services/`) and 2 under
+29 Dart files in total — 24 under `lib/` (1 entrypoint, 5 in
+`database/`, 6 migrations, 6 models, 6 in `services/`) and 5 under
 `test/`. Substantial enough to demonstrate real architecture; small
 enough to read in fifteen minutes.
 
@@ -64,8 +67,9 @@ is implemented:
 1. **Config tables replace hardcoded enums** — types the app once
    shipped as enums move to data tables, so users can add or edit them
    without a code change. v26 demonstrates the pivot at small scale by
-   replacing a `NoteCategory` enum with a `categories` table seeded so
-   existing rows resolve without backfill. The `Pipeline`,
+   replacing a `NoteCategory` enum with a `categories` table whose
+   seed IDs equal the enum's persisted names, so rows that stored
+   those names resolve without backfill. The `Pipeline`,
    `CustomStage`, `StageDefinition`, and `TransitionEvent` models, plus
    the matching DAOs and registries, sketch the same pattern at
    workflow-engine scale — see *What's not here* for the caveat.
@@ -97,8 +101,11 @@ is implemented:
    desktop, and web to the right SQLite backend without runtime checks.
    *([database_initializer.dart][init])*
 
-7. **Local-only backup and restore** — atomic copy-then-rename restore
-   with no cloud dependency. The user's data goes wherever they put it.
+7. **Local-only backup and restore** — a WAL-checkpointed export, and
+   a restore that validates the backup (SQLite header, `quick_check`,
+   schema version no newer than the app's) before an atomic
+   copy-then-rename swap. No cloud dependency: the user's data goes
+   wherever they put it.
    *([local_backup_service.dart][backup])*
 
 8. **Sync-ready schema from day one** — the universal-columns
@@ -195,17 +202,20 @@ flutter pub get
 flutter test          # the contract claims, verified
 ```
 
-`flutter test` is the canonical entry point for this repo. The two
-test files verify the architectural claims that ARCHITECTURE.md
-makes — idempotent migrations, registration of every version up to
-`kSchemaVersion`, the v36 dedup logic and unique-index contract, and
-the last-writer-wins invariant that soft-delete depends on. They run
-against an in-memory SQLite database, so the suite executes the real
-migration runner without writing to disk.
+`flutter test` is the canonical entry point for this repo. The test
+files verify the architectural claims that ARCHITECTURE.md makes —
+the migration runner's idempotency catch, all-or-nothing upgrades,
+`kSchemaVersion` matching the highest registered migration, the v36
+dedup logic and unique-index contract, the last-writer-wins
+invariant that soft-delete depends on (in UTC), and backup
+validation. Most run against an in-memory SQLite database, so the
+suite executes the real migration runner without writing to disk;
+the upgrade-rollback and backup tests use a temp directory because
+they need real files to close and reopen.
 
 Reading those tests is a faster path into the codebase than reading
-the source top-down — each test docstring names the specific
-ARCHITECTURE.md section the assertion is verifying.
+the source top-down — the test docstrings name the specific
+ARCHITECTURE.md section each assertion is verifying.
 
 `flutter run` is **not** wired up in this published cut. `main.dart`
 calls `loadPipelineRegistry()` and `loadStageRegistry()` at startup,

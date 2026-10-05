@@ -11,8 +11,9 @@ import '../../models/pipeline.dart';
 /// and in what order. The in-memory cache lives in [PipelineRegistry];
 /// this DAO is what that registry talks to.
 ///
-/// Built-in pipelines are seeded in migration v26 and are protected
-/// from deletion at the SQL level via the `isBuiltIn = 0` clause in
+/// Built-in pipelines are seeded by production migrations that aren't
+/// in this published cut (no migration here creates `pipeline_types`),
+/// and are protected from deletion at the SQL level via the `isBuiltIn = 0` clause in
 /// [delete]. Built-ins can be reordered and renamed, but never removed.
 class PipelinesDao {
   final DatabaseService _db;
@@ -55,7 +56,7 @@ class PipelinesDao {
     required String emoji,
     required List<String> stages,
   }) async {
-    final now = DateTime.now();
+    final now = DateTime.now().toUtc();
     final pipeline = Pipeline(
       id:        const Uuid().v4(),
       name:      name,
@@ -73,15 +74,16 @@ class PipelinesDao {
     final db = await _database;
     await db.update(
       'pipeline_types',
-      pipeline.copyWith(updatedAt: DateTime.now()).toMap(),
+      pipeline.copyWith(updatedAt: DateTime.now().toUtc()).toMap(),
       where: 'id = ?',
       whereArgs: [pipeline.id],
     );
   }
 
   /// Deletes a custom pipeline. Entities using it retain their
-  /// pipelineId string and will fall back gracefully via the registry
-  /// (which returns a sensible default when given an unknown ID).
+  /// pipelineId string; [PipelineRegistry.get] returns null for that
+  /// unknown ID, so callers must handle null (e.g. a "pipeline deleted"
+  /// placeholder or their own fallback).
   ///
   /// Built-in pipelines cannot be deleted — the WHERE clause filters
   /// them out at the SQL level rather than relying on application-side
@@ -100,13 +102,14 @@ class PipelinesDao {
   /// reorder UI which needs to update every affected row at once.
   Future<void> updateSortOrders(List<Pipeline> ordered) async {
     final db = await _database;
+    final now = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
       for (var i = 0; i < ordered.length; i++) {
         await txn.update(
           'pipeline_types',
           {
             'sortOrder': i,
-            'updatedAt': DateTime.now().toIso8601String(),
+            'updatedAt': now,
           },
           where: 'id = ?',
           whereArgs: [ordered[i].id],
