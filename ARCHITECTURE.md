@@ -6,7 +6,7 @@ lives. This document tells you *why* — what problem each decision
 solves, what alternatives were considered, and where the seams are
 that future work would extend.
 
-The nine decisions below are roughly ordered from most foundational
+The ten decisions below are roughly ordered from most foundational
 to most product-facing. The earlier ones are the ones the rest depend
 on; the later ones are the ones that would be easiest to swap out.
 
@@ -90,6 +90,19 @@ clause, custom rows held alongside built-ins under a unified
 `StageDefinition` interface — but you can't actually run them
 end-to-end against this cut's schema. The runnable demonstration of
 the underlying pattern is v26.
+
+Production has since taken the pattern one step further than this
+cut shows. The built-in stages here still come from a Dart enum
+([`BuiltInStage`](lib/models/built_in_stage.dart)); in production
+that enum is gone. Built-in stages are now *data contributed by
+code*: a small core pack (`concept`, `finished`, `sold`, `died`)
+plus one stage pack per compiled craft module (§10), composed into
+`StageRegistry` at startup. Terminal semantics went the same way.
+SQL that used to say `NOT IN ('finished','sold','died')` now builds
+its placeholder list from the registry's `isTerminal` flags, so a
+module that defines its own terminal stage gets correct filtering
+without a core edit. The stage ids stayed byte-identical through
+the change, because they're the persisted keys in user rows.
 
 ### Why not the alternatives
 
@@ -316,6 +329,17 @@ through the local logging layer described in §9. A rethrow here
 aborts startup, and the log is the only artifact that survives to
 explain why.
 
+And the runner is no longer the only migration lane. Once the app
+split into a craft-agnostic core plus per-craft modules (§10),
+global numbering stopped being safe: two builds compiling different
+modules would both call their schema "v46" while meaning different
+things. Core keeps the numbered chain described here. Each module
+now carries its own version, tracked in a `module_schema` table
+(production v45) and applied by a second, much smaller runner that
+reuses this one's idempotency tolerance verbatim. §10 has the
+details; the point for this section is that the two-string catch
+turned out to be reusable infrastructure, not a one-off.
+
 ### Verified by
 
 [`test/migration_idempotency_test.dart`](test/migration_idempotency_test.dart)
@@ -467,7 +491,10 @@ getters thereafter. `StageRegistry` additionally pre-loads the
 built-in stages from the [`BuiltInStage`](lib/models/built_in_stage.dart)
 enum at construction time, so even before any DB load the built-in
 stages are available — `loadCustom()` only adds the user-created
-ones to the unified view.
+ones to the unified view. (In production the enum has been replaced
+by stage packs that compiled modules contribute; see §1 and §10.
+The registry's shape didn't change, only where its built-ins come
+from.)
 
 The registries deliberately don't auto-refresh. When application code
 creates, updates, or deletes a pipeline, it's the caller's
@@ -520,8 +547,9 @@ registries hold mutable in-memory state; if multiple processes ever
 share the same database file, each process has its own registry and
 its own view of the world.
 
-Concretely: built-in stages are compiled from a static enum and are
-identical across processes — that part is fine. Custom stages and
+Concretely: built-in stages are compiled into the binary (an enum
+here, module stage packs in production) and are identical across
+processes — that part is fine. Custom stages and
 pipelines are DB-backed, so a write from process A would leave
 process B's cache stale until B calls `loadCustom()` or `load()`
 again. The same staleness applies to any settings layer that caches
@@ -539,6 +567,15 @@ instance, so there's no shared Dart memory anyway, which is why
 this hasn't come up. SQLite itself handles concurrent file access
 safely via file locking; the architectural gap is at the cache
 layer, not the database layer.
+
+Composing built-ins from several packs opened a second seam that
+production has already closed. Stage ids are one global namespace,
+and `get(id)` returns the first match, so two craft modules that
+both shipped a `drying` stage would silently render one craft's
+label on the other's pieces. That can't be repaired after the fact,
+because the ids are persisted in user rows. The composed list is
+now asserted unique at the first lookup, so a colliding pack fails
+in debug and test builds rather than in someone's data.
 
 ---
 
@@ -765,17 +802,16 @@ contract is local to the sync schema. The second-payoff story
 matters more than the technical fix: it's the same pattern as v31,
 the second time, and it stays cheap for the same reason.
 
-(A numbering honesty note: production's migration numbering has
-moved past this cut. Versions 1–31 here carry their original
-production numbers; after v31, production's own v32–v36 went to
-sync pairing tokens, import provenance, the foreign-key repair
-described in §3, and the sync history log below. The tombstone
-hardening published here keeps the number 36 so its references to
-v31 stay coherent within this cut.)
+(A numbering note: every migration published here carries its
+production number, v36 included. Production's v32 added the pairing
+token, v33 import provenance, v34–v35 the foreign-key repair
+described in §3, and v36 is this exact tombstone hardening, with
+identical SQL. An earlier revision of this document said otherwise;
+it was wrong. Production has since moved on to v45.)
 
 Production's own recent schema work keeps making the same point.
 Its v32 gave the device registry an authentication credential — one
-nullable `ALTER TABLE ADD COLUMN`. Its v36 answered a diagnosability
+nullable `ALTER TABLE ADD COLUMN`. Its v44 answered a diagnosability
 problem: the only persisted sync state was a per-device
 "last synced at" watermark, so "sync has been failing for a week"
 was invisible — the status screen could only describe the current
@@ -847,12 +883,35 @@ refinements the schema anticipated and one it didn't:
   contract; whether the runtime routes through it belongs to the
   user.
 
-Two guard rails round it out. Devices refuse to sync unless their
-schema versions match exactly — there is no cross-version
-translation on the wire; the migration runner (§3) is the only
-component allowed to move data between schema shapes. And photo
-files travel outside the row delta entirely, as a manifest plus
-lazy authenticated pulls (§7).
+Two guard rails round it out. The first is a schema-version gate,
+and it's a range rather than an equality check. Each device reports
+its current version and a floor (`kSchemaVersionMin`, currently 37),
+and two peers sync only when each sits inside the other's
+`[min, current]` window. An earlier strict-equality check broke sync
+on every additive migration, even though additive migrations are
+exactly what the universal-columns convention makes safe. There is
+still no translation on the wire; the floor only moves when a
+migration lands that an older peer genuinely can't read, and the
+migration runner (§3) remains the only component allowed to move
+data between schema shapes. The second guard rail: photo files
+travel outside the row delta entirely, as a manifest plus lazy
+authenticated pulls (§7).
+
+The modularization in §10 forced one more rule onto the merger.
+Two builds can now report the same core schema version while owning
+different tables, because a multi-craft build compiles modules a
+single-craft build doesn't, and module composition isn't part of
+the handshake. Before the fix, the first unknown table in a delta
+threw *inside* the merge transaction and rolled back every other
+table with it, so a single woodworking row meant a pottery-only
+peer silently synced nothing, every round. The merger now checks
+which tables exist locally, skips unknown ones (counting their rows
+as skips so the sync summary shows them), and applies the same
+check to tombstones. The list of tables a device *sends* is no
+longer hardcoded either: it's composed from core's specs plus each
+compiled module's declared tables, sorted into the same dependency
+tiers the old hardcoded list used, and a golden test pins the
+order.
 
 So the contract held, with one honest amendment: the original
 sentence here — any runtime "has to read from `updatedAt`, write to
@@ -986,46 +1045,196 @@ decision, not drift.
 
 ---
 
+## 10. Maker modules: the craft as a plugin
+
+*Like §8's runtime and §9, this shipped in the production app after
+this cut was published, and its code is not republished. This cut
+predates the split: its `lib/` is laid out the way production's was
+before it.*
+
+### The problem
+
+My Pottery Studio was a pottery app all the way down. Kiln logs,
+glaze recipes, and clay reclaim lived beside sales, clients, and
+commissions, and nothing in the code distinguished them. But a
+woodworker, a jeweller, or a glassblower needs nearly all of the
+second group and none of the first. Two products wanted to come out
+of the same codebase: the branded pottery app (already live, with
+real user data that must not move), and a multi-craft app where the
+user switches crafts on and off.
+
+The architectural problem: how do you carve a craft out of an app
+that was built as that craft, without migrating a single existing
+user's data, and without the carve-out quietly growing back?
+
+### The decision
+
+Split the app into a **core** and **maker modules**. Core holds
+everything any maker business needs: pieces and the pipeline engine
+from §1, sales, clients, commissions, materials, photos, sync,
+backup, settings, captions, the paywall. A module holds what makes a
+craft different: its stage vocabulary, its default pipelines, its
+own tables, and the screens and dashboard cards that sit on them.
+Pottery became the first module. The business features stayed core
+rather than becoming a "base business module", because no build
+would ever exclude them, so modularizing them would buy only
+indirection.
+
+A module is one abstract class, `MakerModule`, where every member
+has an empty default, so a new module compiles from its first line.
+It declares data contributions (synced tables with their dependency
+tier, a stage pack, pipeline seeds, its own migrations, material
+consumption sources) and UI contributions (drawer entries, quick
+actions, dashboard sections, piece-detail and piece-form sections,
+settings rows). An entrypoint's config lists the modules to compile
+in, and a composition root hands them to core's registries. Core
+never imports a module.
+
+Three rules make it hold.
+
+**Compiled versus enabled.** Data-shaped contributions come from
+every *compiled* module; UI-shaped ones come from *enabled* modules
+only. Turning pottery off in the multi-craft app hides its drawer
+entries and dashboard cards, but its tables keep syncing and its
+stages keep resolving display names. A piece sitting at
+`bisque_firing` still renders correctly after the toggle, because
+the stage pack never stopped loading. Hiding is reversible;
+forgetting data isn't, so the toggle is only ever allowed to hide.
+
+**Two migration lanes.** The numbered chain from §3 is frozen as
+history for the tables it already created, and keeps going for
+craft-agnostic core changes only. Module tables migrate in their
+own lane: a `module_schema` table records each compiled module's
+version, and a small runner applies anything newer on every open.
+Pottery sits at module version 0, since the legacy chain already
+created its tables, so nothing was re-stated and there was no risk
+window. A module added to a two-year-old install, or a pottery
+backup restored into the multi-craft app, just migrates itself from
+0 on next launch. `PRAGMA user_version` keeps meaning "core schema"
+in every build, which is what keeps §7's backup version gate and
+§8's sync handshake honest.
+
+**The boundary is a test, not a convention.** A source-scanning
+test fails the build if any core file imports a module, if any core
+file so much as *names* a pottery type, or if one module imports
+another. The universal-columns convention in §2 is enforced by
+review and that's been fine; a dependency rule erodes one
+convenient import at a time, so this one got a machine.
+
+The data decisions all followed one principle: move code, never
+rows. Pottery's columns on the `pieces` table (finished weight,
+reclaim state, surface area) stayed exactly where they were. Moving
+them to a satellite table would have rewritten every user's busiest
+table inside a migration and changed how pieces merge in sync,
+across devices that upgrade at different times. New modules follow
+a different rule, keying their own tables by piece id. A planned
+`Piece.extras` map for craft data on the core row was dropped before
+it was built, because no module ended up needing it. The database
+file is still named `pottery_studio.db` in every build, because
+renaming it would orphan every existing install.
+
+The proof was a second module. A skeletal woodworking module (one
+stage pack, one pipeline, one table arriving through a real module
+migration, one dashboard card) was added with zero edits to core
+and one line in the multi-craft entrypoint. A test pins that claim
+so a later change can't weaken it quietly.
+
+### Why not the alternatives
+
+Separate packages (a melos workspace with `studio_core` and
+`studio_pottery`) were the textbook answer. They'd have bought
+compiler-enforced boundaries at the cost of a package-per-module
+build setup on a solo-maintained app. Folders plus a boundary test
+get the same rule today, and they keep extraction a mechanical
+`git mv` for whenever packages earn their keep.
+
+Forking the app per craft would have been fastest for the second
+product and the worst for every product after it. Every sync fix
+from §8 would need porting N times.
+
+A clean, consolidated fresh-install schema per build (so a
+woodworking-only install never sees an empty `glaze_recipes` table)
+would be tidier. It would also be a second creation path that has
+to be proven equivalent to the one every existing install went
+through. Fresh installs of every build still run the full legacy
+chain, empty pottery tables included. Invisible clutter was the
+cheaper risk.
+
+### Where the seams are
+
+Cross-composition sync is safe but lossy. §8's unknown-table skip
+stops a multi-craft peer from breaking a pottery-only peer, but the
+woodworking rows still don't arrive there. Passing unknown tables
+through as opaque storage would fix that, and it's much more complex
+than the problem currently warrants.
+
+The deepest remaining coupling isn't a code question. Core's
+`MaterialType` enum has ceramic members (`clay`, `reclaimClay`,
+`commercialGlaze`), and the free tier's limit counts exactly those.
+Generalizing the enum means deciding what "five free materials"
+means in a build with no clay: five of anything, five per module,
+or a per-module limit policy. Each answer prices the free tier
+differently, so it's a monetization decision wearing a refactor's
+clothes. It also needs a migration that keeps reading the old
+persisted values.
+
+Two cosmetic switches stay hardcoded on purpose: the piece-type
+icon map and the firing-stage colours in the pipeline widget. An
+unknown value falls through to a neutral default, so another craft
+gets something bland rather than something wrong.
+
+And the move itself had a cost worth recording. Relocating 203
+files under `lib/core/` was meant to be logic-free, and almost was.
+Four `return await` calls inside `try` blocks lost their `await`
+along the way, so failures escaped the `catch` that was supposed to
+turn them into result objects: a failed backup export threw instead
+of reporting, and a peer's 401 could throw out of the sync call. The
+analyzer's `unawaited_return_in_try_block` lint caught it, and the
+restored lines now carry comments saying why the `await` matters. A
+"pure move" is only pure if something checks.
+
+---
+
 ## A note on what's missing
 
-This document is structured around nine architectural decisions, but
+This document is structured around ten architectural decisions, but
 real architecture isn't really decomposable into a list. The
 decisions interact. The DAO pattern only works because the migration
 runner is reliable. The registries only work because the schema is
 queryable. The sync foundation only works because the universal
 columns were established in v01. The observability layer earns its
 keep at exactly the moments the others fail — its startup guard
-exists to catch the migration runner's rethrow.
+exists to catch the migration runner's rethrow. And the module split
+in §10 leaned on almost all of them at once: the registries became
+its composition points, the migration runner's idempotency net
+became its second lane, and sync had to learn to tolerate tables it
+had never seen.
 
 If you read this whole document and the code, what you should come
-away with is not "here are nine clever things" but "here is a
+away with is not "here are ten clever things" but "here is a
 coherent way of thinking about offline-first data architecture, where
-each piece is shaped by the others." The nine headings are
+each piece is shaped by the others." The ten headings are
 pedagogical scaffolding; the architecture is the relationships
 between them.
 
 The relationships are also where this repo is most honest. The full
-app is at schema v36 with new versions shipping on an ongoing basis;
-six representative versions are published here. The published
-numbering matches production through v31; after that, production's
-own v32–v36 went to sync pairing tokens, import provenance, the
-foreign-key repair (§3), and the sync history log (§8), so the
-tombstone-hardening migration published here as v36 carries that
-number for this cut's internal coherence rather than as a claim
-about production's v36. The production schema covers many tables
-across several domains; this cut runs four (`notes`, `tags`,
-`note_tags`, `categories`) and adds three more in the v31 sync
-foundation (`sync_trusted_devices`, `sync_hard_delete_log`,
-`sync_conflicts`). The workflow-engine tables that the sketched
-`Pipeline` / `CustomStage` code would query (`pipeline_types`,
-`custom_stages`, plus `pipelineId` / `currentStage` columns on notes)
-are not in this cut — the runnable demonstration of their underlying
-pattern is v26's categories migration. The sync runtime and the
-observability layer have shipped in the product; they are described
-in §8 and §9, but none of their code is here. What's published is
-enough to demonstrate the patterns and verify the case study's
-claims. It is not enough to clone-and-ship a competing product, and
-that's deliberate.
+app is at schema v45 with new versions shipping on an ongoing basis;
+six representative versions are published here, each under its
+production number (v01, v11, v12, v26, v31, v36). The production
+schema covers many tables across several domains and two craft
+modules; this cut runs four (`notes`, `tags`, `note_tags`,
+`categories`) and adds three more in the v31 sync foundation
+(`sync_trusted_devices`, `sync_hard_delete_log`, `sync_conflicts`).
+The workflow-engine tables that the sketched `Pipeline` /
+`CustomStage` code would query (`pipeline_types`, `custom_stages`,
+plus `pipelineId` / `currentStage` columns on notes) are not in this
+cut — the runnable demonstration of their underlying pattern is
+v26's categories migration. The sync runtime, the observability
+layer, and the module system have shipped in the product; they are
+described in §8, §9, and §10, but none of their code is here. What's
+published is enough to demonstrate the patterns and verify the case
+study's claims. It is not enough to clone-and-ship a competing
+product, and that's deliberate.
 
 ---
 
