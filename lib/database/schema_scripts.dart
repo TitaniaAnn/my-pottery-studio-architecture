@@ -12,7 +12,7 @@ import 'migrations/v36.dart';
 ///
 /// ─── Note on this repository ──────────────────────────────────────
 /// This is the architecture-reference fork of My Pottery Studio. The
-/// production app is at v36+ schema versions, with new versions
+/// production app is at v45+ schema versions, with new versions
 /// shipping on an ongoing basis. Six representative versions are
 /// published here, with their original numbers preserved so that
 /// later migrations' references to earlier ones (v31's reliance on

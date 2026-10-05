@@ -124,6 +124,18 @@ is implemented:
    cut was published; it is documented in [ARCHITECTURE.md][arch] §9
    but its code is not in this repo.
 
+10. **Maker modules** — the app split into a craft-agnostic core and
+    per-craft modules behind one `MakerModule` contract, so pottery
+    became the first module and a woodworking pilot was added with
+    zero core edits. Data contributions (tables, stages, migrations)
+    load from every compiled module, UI contributions only from
+    enabled ones, so switching a craft off hides it without
+    orphaning its data. Module tables migrate in their own versioned
+    lane beside the core chain, and a source-scanning test fails the
+    build if core ever imports a module. Shipped in production after
+    this cut; documented in [ARCHITECTURE.md][arch] §10, code not in
+    this repo.
+
 For a deeper walkthrough of why each decision was made, see
 [ARCHITECTURE.md][arch].
 
@@ -136,16 +148,14 @@ This is a reference architecture. It is deliberately missing:
 - **Domain-specific code.** Glazes, kilns, sales, clients, commissions,
   inventory — all the things that make My Pottery Studio a *product*
   rather than a *pattern* — are not here.
-- **The full migration history.** The production app is at schema v36
+- **The full migration history.** The production app is at schema v45
   with new versions shipping on an ongoing basis. Six representative
-  versions are published here. Versions 1–31 carry their original
-  production numbers; production's numbering diverged after v31 (its
-  own v32–v36 went to sync pairing tokens, import provenance, a
-  foreign-key enforcement repair, and a sync history log — see
-  ARCHITECTURE.md §3 and §8), so the tombstone-hardening migration
-  published here keeps the number 36 for this cut's internal
-  coherence — its references to v31's `sync_hard_delete_log` stay
-  readable — rather than as a claim about production's v36.
+  versions are published here, each under its production number: v36
+  here is production's v36, with identical SQL. The versions in
+  between went to sync pairing tokens, import provenance, a
+  foreign-key enforcement repair (ARCHITECTURE.md §3), synced
+  settings, consignments, a sync history log (§8), and the
+  `module_schema` table behind the module system (§10).
 - **The migrations that create `pipeline_types` and `custom_stages`.**
   The production app has migrations that create these tables and add
   `pipelineId` / `currentStage` columns to notes. Those migrations are
@@ -170,6 +180,10 @@ This is a reference architecture. It is deliberately missing:
   diagnostic logging, opt-in crash reporting, and a guarded startup
   path in mid-2026. Documented in ARCHITECTURE.md §9; none of its
   code is in this cut.
+- **The module system.** Production now splits into `lib/core/` and
+  `lib/modules/<craft>/` with a module contract, registry, and
+  per-module migrations. This cut keeps the pre-split layout.
+  Documented in ARCHITECTURE.md §10.
 
 If you're looking for any of those things, you're looking for a
 different repo.
